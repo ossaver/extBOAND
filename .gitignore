@@ -1,0 +1,29 @@
+.env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Planner outputs and local traces
+solution/
+solution_prev/
+solution_C_hg/
+solution_C_nhg/
+*.stats
+*.boand.*.out
+*.boand.*.png
+
+# Backups and archived code
+backups/
+legacy/
+
+# Local documents and papers
+Documents/
+*.pdf
+*.pptx
+*.docx
+
+# Editor and OS files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
