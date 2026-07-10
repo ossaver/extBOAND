@@ -23,7 +23,6 @@
 
 (:functions
     (total-cost)
-	(budget)
 	(normal-step-cost)
 	(slip-step-cost)
 )

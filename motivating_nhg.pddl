@@ -36,16 +36,10 @@ first-aid-kit - reward diamond - reward
 	(= (total-cost) 0)
 	(= (normal-step-cost) 1)
 	(= (slip-step-cost) 2)
-	(= (budget) 20)
 )
 (:utility 
     (= (has-reward first-aid-kit) 10) 
     (= (has-reward diamond) 20)
 )
-(:goal
-    (and
-		(<= (total-cost) (budget))
-    )
-)
-
+(:bound 20)
 )
