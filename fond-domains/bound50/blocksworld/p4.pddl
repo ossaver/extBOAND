@@ -1,0 +1,18 @@
+(define (problem bw_5_4)
+  (:domain blocks-domain)
+  (:objects b1 b2 b3 b4 b5 - block)
+  (:init (emptyhand) (on b1 b4) (on b2 b1) (on-table b3) (on b4 b5) (on b5 b3) (clear b2)
+    (= (total-cost) 0)
+    )
+    (:utility
+      (= (emptyhand) 4)
+      (= (on b1 b5) 27)
+      (= (on b2 b3) 5)
+      (= (on b3 b1) 43)
+      (= (on b4 b2) 37)
+      (= (on-table b5) 3)
+      (= (clear b4) 29)
+  )
+
+(:bound 4)
+)

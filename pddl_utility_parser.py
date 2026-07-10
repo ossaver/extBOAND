@@ -12,10 +12,16 @@ class UtilityAssignment:
     value: float
 
 
-# Parses a PDDL problem while preserving custom utility assignments.
+# Parses a PDDL problem while preserving custom utility and bound sections.
 def parse_problem_with_utility(problem_file):
     text = Path(problem_file).read_text(encoding="utf-8")
     stripped_text, utility_sections = _extract_sections(text, ":utility")
+    stripped_text, bound_sections = _extract_sections(stripped_text, ":bound")
+
+    if len(bound_sections) > 1:
+        raise ValueError("Expected at most one :bound section.")
+    bound = _parse_bound_section(bound_sections[0]) if bound_sections else None
+    stripped_text = _ensure_goal_section(stripped_text)
 
     with NamedTemporaryFile(
         mode="w",
@@ -34,6 +40,7 @@ def parse_problem_with_utility(problem_file):
     problem.utility = []
     for section in utility_sections:
         problem.utility.extend(_parse_utility_section(section))
+    problem.bound = bound
 
     return problem
 
@@ -75,6 +82,19 @@ def _extract_sections(text, section_name):
     stripped.append(text[last:])
 
     return "".join(stripped), sections
+
+
+# Adds an empty parser-only goal when the problem has no hard goal section.
+def _ensure_goal_section(text):
+    _unused, goal_sections = _extract_sections(text, ":goal")
+    if goal_sections:
+        return text
+
+    root_start = _skip_ws_and_comments(text, 0)
+    if root_start >= len(text) or text[root_start] != "(":
+        raise ValueError("Expected a parenthesized PDDL problem.")
+    root_end = _find_matching_paren(text, root_start)
+    return text[: root_end - 1] + "\n(:goal (and))\n" + text[root_end - 1 :]
 
 
 # Parses utility section.
@@ -129,6 +149,30 @@ def _parse_utility_assignment(tokens, pos):
 
     pos = _expect(tokens, pos, ")")
     return UtilityAssignment(predicate, tuple(arguments), value), pos
+
+
+# Parses a custom integer total-cost bound.
+def _parse_bound_section(section):
+    tokens = _tokenize(section)
+    pos = 0
+
+    pos = _expect(tokens, pos, "(")
+    if pos >= len(tokens) or tokens[pos].lower() != ":bound":
+        raise ValueError("Expected :bound section.")
+    pos += 1
+
+    if pos >= len(tokens):
+        raise ValueError("Expected integer value in :bound section.")
+    try:
+        bound = int(tokens[pos])
+    except ValueError as exc:
+        raise ValueError(f"Invalid integer bound: {tokens[pos]}") from exc
+    pos += 1
+
+    pos = _expect(tokens, pos, ")")
+    if pos != len(tokens):
+        raise ValueError("Unexpected tokens after :bound section.")
+    return bound
 
 
 # Handles the internal tokenize step.

@@ -1,18 +1,15 @@
 from collections import deque
 from dataclasses import dataclass, field
-from functools import lru_cache
 import heapq
 import math
 import re
 import time
 
-from grounderTypes import Comparator, GroundedNumericExpressionType
-
 import sas_heuristics
 
 
 DETDUP_RE = re.compile(r"_DETDUP_\d+$")
-NO_COST_BOUND = object()
+EPS = 1e-9
 
 
 @dataclass
@@ -32,7 +29,6 @@ class SearchSolution:
     policy: object
     values: dict
     certified: bool = False
-    discovery_iteration: int = 0
 
 
 @dataclass
@@ -90,6 +86,7 @@ def breadth_first_policy_search(
     optimization_order=("Umin", "Cmax", "Umax", "Cmin"),
     use_heuristics=True,
 ):
+    _configure_cost_bound_criterion(sas_task, optimization_order)
     initial_key = sas_task.state_key(
         sas_task.initial_state,
         sas_task.numeric_initial_state,
@@ -149,6 +146,8 @@ def breadth_first_policy_search(
             child = _extend_policy(sas_task, policy, state_key, group_key, actions)
             if child is None:
                 continue
+            if _has_reachable_strategy_cycle(sas_task, child):
+                continue
             signature = policy_signature(child)
             if signature in seen:
                 continue
@@ -172,6 +171,7 @@ def depth_first_and_or_search(
     optimization_order=("Umin", "Cmax", "Umax", "Cmin"),
     use_heuristics=True,
 ):
+    _configure_cost_bound_criterion(sas_task, optimization_order)
     initial_key = sas_task.state_key(
         sas_task.initial_state,
         sas_task.numeric_initial_state,
@@ -224,7 +224,7 @@ def depth_first_and_or_search(
     )
 
 
-# Runs the Pareto-oriented BOAND-style policy search.
+# Runs bi-objective BOAND* over the first two optimization criteria.
 def boand_star_policy_search(
     sas_task,
     max_expansions=None,
@@ -234,6 +234,12 @@ def boand_star_policy_search(
     report_every=10000,
     on_solution=None,
 ):
+    objective_order = tuple(optimization_order[:2])
+    tie_break_order = tuple(optimization_order[2:])
+    if len(objective_order) != 2:
+        raise ValueError("BOAND* requires exactly two primary objectives")
+    _configure_cost_bound_criterion(sas_task, optimization_order)
+
     initial_key = sas_task.state_key(
         sas_task.initial_state,
         sas_task.numeric_initial_state,
@@ -243,18 +249,26 @@ def boand_star_policy_search(
     open_list = []
     seen = set()
     solutions = []
-    incumbents = []
+    q2_last = math.inf
     counter = 0
     expansions = 0
     generated = 1
     max_open = 0
     iterations = 0
-    accepted_count = 0
     start_time = time.time()
 
     _ensure_search_caches(sas_task)
 
-    print(f"Open-list order: {','.join(optimization_order)}", flush=True)
+    print(f"BOAND* objectives: {','.join(objective_order)}", flush=True)
+    print(
+        f"Cost bound criterion: {sas_task.cost_bound_criterion}",
+        flush=True,
+    )
+    print(
+        "Open-list tie-breakers: "
+        + (",".join(tie_break_order) if tie_break_order else "<none>"),
+        flush=True,
+    )
     if max_expansions is None:
         print("Max expansions: unbounded", flush=True)
     else:
@@ -264,57 +278,6 @@ def boand_star_policy_search(
         print("AND/OR Umin depth: unbounded", flush=True)
     else:
         print(f"AND/OR Umin depth: {andor_depth}", flush=True)
-
-    for seed_order, seed_solution in _initial_seed_solutions(
-        sas_task,
-        optimization_order,
-    ):
-        values = seed_solution.values
-        if _is_solution_dominated(values, solutions):
-            continue
-        solutions = _remove_solutions_dominated_by(values, solutions)
-        incumbents = _remove_solutions_dominated_by(values, incumbents)
-        seed_solution.certified = False
-        seed_solution.discovery_iteration = 0
-        solutions.append(seed_solution)
-        incumbents.append(seed_solution)
-        solutions.sort(
-            key=lambda solution: _values_order_key(
-                solution.values,
-                optimization_order,
-            )
-        )
-        accepted_count += 1
-        _print_solution_progress(
-            seed_solution.values,
-            optimization_order,
-            iteration=0,
-            expansions=expansions,
-            generated=generated,
-            solution_count=len(solutions),
-            start_time=start_time,
-            label=f"SEED {','.join(seed_order)}",
-        )
-        if on_solution is not None:
-            on_solution(
-                seed_solution,
-                accepted_count,
-                {
-                    "iterations": iterations,
-                    "expansions": expansions,
-                    "generated": generated,
-                    "max_open": max_open,
-                    "elapsed_time": time.time() - start_time,
-                },
-            )
-        if max_solutions is not None and len(solutions) >= max_solutions:
-            return _make_front_result(
-                solutions,
-                expansions,
-                generated,
-                max_open,
-                "solution limit reached",
-            )
 
     _prepare_policy_for_queue(sas_task, initial_policy)
     initial_f = evaluate_policy_lower_bound(
@@ -333,27 +296,10 @@ def boand_star_policy_search(
         ),
     )
     seen.add(policy_signature(initial_policy))
-    _prune_open_by_solutions(open_list, incumbents)
-    _mark_certified_solutions(
-        solutions,
-        open_list,
-        optimization_order,
-        start_time,
-        iteration=0,
-        expansions=expansions,
-        generated=generated,
-    )
 
     while open_list:
         max_open = max(max_open, len(open_list))
-        if solutions:
-            _order_key, _counter, f_values, policy = _pop_pareto_open_entry(
-                open_list,
-                optimization_order,
-                iterations,
-            )
-        else:
-            _order_key, _counter, f_values, policy = heapq.heappop(open_list)
+        _order_key, _counter, f_values, policy = heapq.heappop(open_list)
         iterations += 1
 
         if report_every and iterations % report_every == 0:
@@ -372,7 +318,9 @@ def boand_star_policy_search(
                 sas_task=sas_task,
             )
 
-        if _is_bound_weakly_dominated_by_solutions(f_values, incumbents):
+        if _violates_total_cost_bound(sas_task, f_values):
+            continue
+        if _bound_pruned_by_last_solution(f_values, objective_order, q2_last):
             continue
 
         _prepare_policy_for_queue(sas_task, policy)
@@ -380,78 +328,58 @@ def boand_star_policy_search(
         if not policy.pending:
             if _policy_is_strong_acyclic_solution(sas_task, policy):
                 values = evaluate_policy(sas_task, policy)
-                if not _is_solution_dominated(values, solutions):
-                    solutions = _remove_solutions_dominated_by(values, solutions)
-                    accepted = SearchSolution(
-                        policy,
-                        values,
-                        certified=False,
-                        discovery_iteration=iterations,
+                if _violates_total_cost_bound(sas_task, values):
+                    continue
+                _require_goal_aware_objectives(
+                    f_values,
+                    values,
+                    objective_order,
+                )
+                q2_last = _criterion_min_value(values, objective_order[1])
+                accepted = SearchSolution(
+                    policy,
+                    values,
+                    certified=True,
+                )
+                solutions.append(accepted)
+                _print_solution_progress(
+                    values,
+                    optimization_order,
+                    iteration=iterations,
+                    expansions=expansions,
+                    generated=generated,
+                    solution_count=len(solutions),
+                    start_time=start_time,
+                )
+                if on_solution is not None:
+                    on_solution(
+                        accepted,
+                        len(solutions),
+                        {
+                            "iterations": iterations,
+                            "expansions": expansions,
+                            "generated": generated,
+                            "max_open": max_open,
+                            "elapsed_time": time.time() - start_time,
+                        },
                     )
-                    solutions.append(accepted)
-                    solutions.sort(
-                        key=lambda solution: _values_order_key(
-                            solution.values,
-                            optimization_order,
-                        )
+                if max_solutions is not None and len(solutions) >= max_solutions:
+                    return _make_front_result(
+                        solutions,
+                        expansions,
+                        generated,
+                        max_open,
+                        "solution limit reached; Pareto coverage is incomplete",
                     )
-                    if not _is_solution_dominated(values, incumbents):
-                        incumbents = _remove_solutions_dominated_by(
-                            values,
-                            incumbents,
-                        )
-                        incumbents.append(accepted)
-                    accepted_count += 1
-                    pruned = _prune_open_by_solutions(open_list, incumbents)
-                    _print_solution_progress(
-                        values,
-                        optimization_order,
-                        iteration=iterations,
-                        expansions=expansions,
-                        generated=generated,
-                        solution_count=len(solutions),
-                        start_time=start_time,
-                    )
-                    if pruned:
-                        print(
-                            f"  pruned_open={pruned} open={len(open_list)}",
-                            flush=True,
-                        )
-                    if on_solution is not None:
-                        on_solution(
-                            accepted,
-                            accepted_count,
-                            {
-                                "iterations": iterations,
-                                "expansions": expansions,
-                                "generated": generated,
-                                "max_open": max_open,
-                                "elapsed_time": time.time() - start_time,
-                            },
-                        )
-                    if max_solutions is not None and len(solutions) >= max_solutions:
-                        return _make_front_result(
-                            solutions,
-                            expansions,
-                            generated,
-                            max_open,
-                            "solution limit reached",
-                        )
             continue
 
-        if _has_reachable_strategy_cycle(policy):
+        if _has_reachable_strategy_cycle(sas_task, policy):
             continue
 
         if max_expansions is not None and expansions >= max_expansions:
-            reason = f"max expansions reached ({max_expansions})"
-            _mark_certified_solutions(
-                solutions,
-                open_list,
-                optimization_order,
-                start_time,
-                iteration=iterations,
-                expansions=expansions,
-                generated=generated,
+            reason = (
+                f"max expansions reached ({max_expansions}); "
+                "Pareto coverage is incomplete"
             )
             return _make_front_result(
                 solutions,
@@ -483,7 +411,7 @@ def boand_star_policy_search(
                 continue
 
             _prepare_policy_for_queue(sas_task, child)
-            if _has_reachable_strategy_cycle(child):
+            if _has_reachable_strategy_cycle(sas_task, child):
                 continue
 
             child_f = evaluate_policy_lower_bound(
@@ -492,11 +420,9 @@ def boand_star_policy_search(
                 heuristic_cache,
                 use_heuristics,
             )
-            if _has_infinite_component(child_f):
+            if _has_infinite_objective_component(child_f, objective_order):
                 continue
             if _violates_total_cost_bound(sas_task, child_f):
-                continue
-            if _is_bound_weakly_dominated_by_solutions(child_f, incumbents):
                 continue
 
             signature = policy_signature(child)
@@ -516,19 +442,6 @@ def boand_star_policy_search(
                 ),
             )
 
-        if report_every and iterations % report_every == 0:
-            _mark_certified_solutions(
-                solutions,
-                open_list,
-                optimization_order,
-                start_time,
-                iteration=iterations,
-                expansions=expansions,
-                generated=generated,
-            )
-
-    for solution in solutions:
-        solution.certified = True
     return _make_front_result(
         solutions,
         expansions,
@@ -579,15 +492,16 @@ def _solve_state_dfs(
 ):
     if sas_task.is_goal_state(*state_key):
         return {}
+    logical_state = _logical_state_key(sas_task, state_key)
     if state_key in solved:
         return dict(solved[state_key])
-    if state_key in failed or state_key in path:
+    if state_key in failed or logical_state in path:
         return None
     if max_expansions is not None and counters["expansions"] >= max_expansions:
         return None
 
     counters["expansions"] += 1
-    path.add(state_key)
+    path.add(logical_state)
 
     for group_key, actions in _applicable_action_groups(
         sas_task,
@@ -636,11 +550,11 @@ def _solve_state_dfs(
         if not _merge_strategy(candidate_strategy, merged_strategy):
             continue
 
-        path.remove(state_key)
+        path.remove(logical_state)
         solved[state_key] = dict(candidate_strategy)
         return candidate_strategy
 
-    path.remove(state_key)
+    path.remove(logical_state)
     failed.add(state_key)
     return None
 
@@ -796,269 +710,92 @@ def _prepare_policy_for_queue(sas_task, policy):
     propagate_policy_metrics(sas_task, policy)
 
 
-# Handles the internal values order key step.
+# Returns a criterion value in the common minimization orientation.
+def _criterion_min_value(values, criterion):
+    if criterion == "Umin":
+        return values["loss_max"]
+    if criterion == "Cmax":
+        return values["Cmax"]
+    if criterion == "Umax":
+        return values["loss_min"]
+    if criterion == "Cmin":
+        return values["Cmin"]
+    raise ValueError(f"Unsupported optimization criterion: {criterion}")
+
+
+# Applies the bound to whichever cost criterion appears first in the key.
+def _cost_bound_criterion(optimization_order):
+    try:
+        cmin_index = optimization_order.index("Cmin")
+        cmax_index = optimization_order.index("Cmax")
+    except ValueError as exc:
+        raise ValueError(
+            "The optimization order must contain both Cmin and Cmax"
+        ) from exc
+    return "Cmin" if cmin_index < cmax_index else "Cmax"
+
+
+# Configures the budget semantics before any heuristic evaluation.
+def _configure_cost_bound_criterion(sas_task, optimization_order):
+    sas_task.cost_bound_criterion = _cost_bound_criterion(
+        tuple(optimization_order)
+    )
+
+
+# Builds the fixed lexicographic key; criteria after the first two only break ties.
 def _values_order_key(values, optimization_order):
-    key = []
-    for criterion in optimization_order:
-        if criterion == "Umin":
-            key.append(values["loss_max"])
-        elif criterion == "Cmax":
-            key.append(values["Cmax"])
-        elif criterion == "Umax":
-            key.append(values["loss_min"])
-        elif criterion == "Cmin":
-            key.append(values["Cmin"])
-        else:
-            raise ValueError(f"Unsupported optimization criterion: {criterion}")
+    key = [
+        _criterion_min_value(values, criterion)
+        for criterion in optimization_order
+    ]
     key.append(-values.get("size", 0))
     return tuple(key)
 
 
-# Handles the internal pop pareto open entry step.
-def _pop_pareto_open_entry(open_list, optimization_order, iterations):
-    orders = _pareto_selection_orders(optimization_order)
-    selected_order = orders[iterations % len(orders)]
-    if selected_order == tuple(optimization_order):
-        return heapq.heappop(open_list)
-
-    selected_index = min(
-        range(len(open_list)),
-        key=lambda index: (
-            _values_order_key(open_list[index][2], selected_order),
-            open_list[index][1],
-        ),
-    )
-    entry = open_list[selected_index]
-    last = open_list.pop()
-    if selected_index < len(open_list):
-        open_list[selected_index] = last
-        heapq.heapify(open_list)
-    return entry
+# Applies BOAND*'s constant-time dominance check at extraction time.
+def _bound_pruned_by_last_solution(bound_values, objective_order, q2_last):
+    if q2_last == math.inf:
+        return False
+    f2 = _criterion_min_value(bound_values, objective_order[1])
+    return q2_last <= f2 + EPS
 
 
-# Handles the internal pareto selection orders step.
-def _pareto_selection_orders(optimization_order):
-    candidates = [
-        tuple(optimization_order),
-        ("Cmax", "Cmin", "Umin", "Umax"),
-        ("Cmin", "Cmax", "Umin", "Umax"),
-        ("Umax", "Cmax", "Umin", "Cmin"),
-    ]
-
-    orders = []
-    for order in candidates:
-        if order not in orders:
-            orders.append(order)
-    return orders
+# Enforces the goal-aware condition required by BOAND*.
+def _require_goal_aware_objectives(bound_values, solution_values, objective_order):
+    for criterion in objective_order:
+        bound = _criterion_min_value(bound_values, criterion)
+        exact = _criterion_min_value(solution_values, criterion)
+        if not math.isclose(bound, exact, rel_tol=0.0, abs_tol=EPS):
+            raise ValueError(
+                f"BOAND* requires a goal-aware f-value for {criterion}: "
+                f"bound={bound}, exact={exact}"
+            )
 
 
-# Handles the internal minimization vector step.
-def _minimization_vector(values):
-    return (
-        values["loss_max"],
-        values["Cmax"],
-        values["loss_min"],
-        values["Cmin"],
-    )
-
-
-# Handles the internal weakly dominates min step.
-def _weakly_dominates_min(lhs, rhs):
-    lhs_vector = _minimization_vector(lhs)
-    rhs_vector = _minimization_vector(rhs)
-    return all(a <= b for a, b in zip(lhs_vector, rhs_vector))
-
-
-# Handles the internal dominates min step.
-def _dominates_min(lhs, rhs):
-    lhs_vector = _minimization_vector(lhs)
-    rhs_vector = _minimization_vector(rhs)
-    return (
-        all(a <= b for a, b in zip(lhs_vector, rhs_vector))
-        and any(a < b for a, b in zip(lhs_vector, rhs_vector))
-    )
-
-
-# Checks whether solution dominated.
-def _is_solution_dominated(values, solutions):
+# Ignores infinite tie-breaker values when deciding objective feasibility.
+def _has_infinite_objective_component(values, objective_order):
     return any(
-        _weakly_dominates_min(solution.values, values)
-        for solution in solutions
+        math.isinf(_criterion_min_value(values, criterion))
+        for criterion in objective_order
     )
-
-
-# Handles the internal remove solutions dominated by step.
-def _remove_solutions_dominated_by(values, solutions):
-    return [
-        solution
-        for solution in solutions
-        if not _dominates_min(values, solution.values)
-    ]
-
-
-# Checks whether bound weakly dominated by solutions.
-def _is_bound_weakly_dominated_by_solutions(bound_values, solutions):
-    return any(
-        _weakly_dominates_min(solution.values, bound_values)
-        for solution in solutions
-    )
-
-
-# Checks whether the object has infinite component.
-def _has_infinite_component(values):
-    return any(math.isinf(value) for value in _minimization_vector(values))
 
 
 # Handles the internal violates total cost bound step.
 def _violates_total_cost_bound(sas_task, values):
-    bound = _total_cost_goal_bound(sas_task)
+    bound = getattr(sas_task, "cost_bound", None)
     if bound is None:
         return False
-    budget_cmax = values.get("Cmax_budget", values["Cmax"])
-    return budget_cmax > bound + 1e-9
 
+    criterion = getattr(sas_task, "cost_bound_criterion", "Cmax")
+    if criterion == "Cmin":
+        return values["Cmin"] > bound + EPS
+    if criterion != "Cmax":
+        raise ValueError(f"Unsupported cost bound criterion: {criterion}")
 
-# Handles the internal total cost goal bound step.
-def _total_cost_goal_bound(sas_task):
-    cached = getattr(sas_task, "_total_cost_goal_bound", NO_COST_BOUND)
-    if cached is not NO_COST_BOUND:
-        return cached
-
-    limits = []
-    for goal in sas_task.goals:
-        for condition in goal.numeric_conditions:
-            limit = _extract_total_cost_upper_bound(sas_task, condition)
-            if limit is not None:
-                limits.append(limit)
-
-    bound = min(limits) if limits else None
-    sas_task._total_cost_goal_bound = bound
-    return bound
-
-
-# Extracts total cost upper bound.
-def _extract_total_cost_upper_bound(sas_task, condition):
-    if len(condition.terms) != 2:
-        return None
-
-    left, right = condition.terms
-    if (
-        condition.comparator == Comparator.CMP_LESS_EQ
-        and _numeric_expression_is_total_cost(sas_task, left)
-    ):
-        return _constant_goal_numeric_value(sas_task, right)
-
-    if (
-        condition.comparator == Comparator.CMP_GREATER_EQ
-        and _numeric_expression_is_total_cost(sas_task, right)
-    ):
-        return _constant_goal_numeric_value(sas_task, left)
-
-    return None
-
-
-# Handles the internal numeric expression is total cost step.
-def _numeric_expression_is_total_cost(sas_task, expression):
-    if expression.type != GroundedNumericExpressionType.GE_VAR:
-        return False
-    for var in sas_task.numeric_variables:
-        if var.index == expression.index:
-            return str(var.fncIndex) == "total-cost"
-    return False
-
-
-# Handles the internal constant goal numeric value step.
-def _constant_goal_numeric_value(sas_task, expression):
-    expression_type = expression.type
-    if expression_type == GroundedNumericExpressionType.GE_NUMBER:
-        return float(expression.value)
-
-    if expression_type == GroundedNumericExpressionType.GE_VAR:
-        for pos, var in enumerate(sas_task.numeric_variables):
-            if var.index == expression.index:
-                return sas_task.numeric_initial_state[pos]
-        return None
-
-    if expression_type == GroundedNumericExpressionType.GE_SUM:
-        values = [
-            _constant_goal_numeric_value(sas_task, sub)
-            for sub in expression.terms
-        ]
-        if any(value is None for value in values):
-            return None
-        return sum(values)
-
-    if expression_type == GroundedNumericExpressionType.GE_SUB:
-        values = [
-            _constant_goal_numeric_value(sas_task, sub)
-            for sub in expression.terms
-        ]
-        if any(value is None for value in values):
-            return None
-        if len(values) == 1:
-            return -values[0]
-        result = values[0]
-        for value in values[1:]:
-            result -= value
-        return result
-
-    return None
-
-
-# Prunes open by solutions.
-def _prune_open_by_solutions(open_list, solutions):
-    before = len(open_list)
-    if before == 0 or not solutions:
-        return 0
-
-    open_list[:] = [
-        entry
-        for entry in open_list
-        if not _is_bound_weakly_dominated_by_solutions(entry[2], solutions)
-    ]
-    if len(open_list) != before:
-        heapq.heapify(open_list)
-    return before - len(open_list)
-
-
-# Marks certified solutions.
-def _mark_certified_solutions(
-    solutions,
-    open_list,
-    optimization_order,
-    start_time,
-    iteration,
-    expansions,
-    generated,
-):
-    if not solutions:
-        return
-
-    open_bounds = [entry[2] for entry in open_list]
-    for solution in solutions:
-        if solution.certified:
-            continue
-        if _solution_can_be_dominated_by_open(solution.values, open_bounds):
-            continue
-        solution.certified = True
-        _print_solution_progress(
-            solution.values,
-            optimization_order,
-            iteration=iteration,
-            expansions=expansions,
-            generated=generated,
-            solution_count=len(solutions),
-            start_time=start_time,
-            label="CERTIFIED",
-        )
-
-
-# Handles the internal solution can be dominated by open step.
-def _solution_can_be_dominated_by_open(solution_values, open_bounds):
-    return any(
-        _dominates_min(bound_values, solution_values)
-        for bound_values in open_bounds
-    )
+    budget_cmax = values.get("Cmax_budget")
+    if budget_cmax is None:
+        budget_cmax = values["Cmax"]
+    return budget_cmax > bound + EPS
 
 
 # Ensures search caches.
@@ -1095,11 +832,10 @@ def _print_solution_progress(
     generated,
     solution_count,
     start_time,
-    label="SOLUTION",
 ):
     elapsed = time.time() - start_time
     print(
-        f"{label} at it={iteration}: "
+        f"SOLUTION at it={iteration}: "
         f"values={_format_order_values(values, optimization_order)} "
         f"solutions={solution_count} "
         f"size={values.get('size')} "
@@ -1132,7 +868,6 @@ def _print_search_progress(
         else "<none>"
     )
     cache_info = _cache_info(sas_task)
-    certified_count = sum(1 for solution in solutions if solution.certified)
     print(
         f"[{elapsed:8.1f}s] "
         f"it={iterations} exp={expansions} gen={generated} "
@@ -1140,7 +875,7 @@ def _print_search_progress(
         f"key={order_key} "
         f"bound={_format_order_values(values, optimization_order)} "
         f"policy_size={len(policy.strategy)} pending={len(policy.pending)} "
-        f"solutions={len(solutions)} certified={certified_count} best={best_text} "
+        f"solutions={len(solutions)} best={best_text} "
         f"cache={cache_info}",
         flush=True,
     )
@@ -1164,315 +899,6 @@ def _cache_info(sas_task):
         f"cost:{len(cost_cache)} "
         f"cond_cost:{len(conditional_cost_cache)}"
     )
-
-
-# Handles the internal initial seed solutions step.
-def _initial_seed_solutions(sas_task, optimization_order):
-    seen_values = set()
-    for seed_order in _pareto_selection_orders(optimization_order):
-        seed = _lexicographic_seed_solution(sas_task, seed_order)
-        if seed is None:
-            continue
-        signature = _rounded_value_signature(seed.values)
-        if signature in seen_values:
-            continue
-        seen_values.add(signature)
-        yield seed_order, seed
-
-
-# Handles the internal lexicographic seed solution step.
-def _lexicographic_seed_solution(sas_task, seed_order):
-    initial_key = sas_task.state_key(
-        sas_task.initial_state,
-        sas_task.numeric_initial_state,
-    )
-    solving = set()
-
-    # Solves the current state inside the local dynamic program.
-    @lru_cache(maxsize=None)
-    def solve(state_key):
-        if not _numeric_goal_bounds_hold(sas_task, state_key):
-            return None
-        if state_key in solving:
-            return None
-
-        solving.add(state_key)
-        try:
-            best = None
-
-            if _base_goal_satisfied(sas_task, state_key):
-                metrics = _closure_metrics_for_state(sas_task, state_key)
-                best = (metrics, ("close",))
-
-            for group_key, actions in _normal_action_groups(sas_task, state_key):
-                child_metrics = []
-                valid = True
-                for action in actions:
-                    successor = _cached_successor(sas_task, state_key, action)
-                    if successor == state_key:
-                        valid = False
-                        break
-
-                    result = solve(successor)
-                    if result is None:
-                        valid = False
-                        break
-                    child_metrics.append(result[0])
-
-                if not valid or not child_metrics:
-                    continue
-
-                metrics = StateMetrics(
-                    cost_min=min(metric.cost_min for metric in child_metrics),
-                    cost_max=max(metric.cost_max for metric in child_metrics),
-                    loss_min=min(metric.loss_min for metric in child_metrics),
-                    loss_max=max(metric.loss_max for metric in child_metrics),
-                )
-                candidate = (metrics, ("act", group_key, tuple(actions)))
-                if best is None or _metrics_order_key(
-                    metrics,
-                    seed_order,
-                ) < _metrics_order_key(best[0], seed_order):
-                    best = candidate
-
-            return best
-        finally:
-            solving.remove(state_key)
-
-    result = solve(initial_key)
-    if result is None:
-        return None
-
-    policy = BasicPolicy.make_initial(initial_key)
-    building = set()
-
-    # Reconstructs the policy choices selected by the dynamic program.
-    def build(state_key):
-        if state_key in policy.strategy or sas_task.is_goal_state(*state_key):
-            return True
-        if state_key in building:
-            return False
-        building.add(state_key)
-
-        selected = solve(state_key)
-        if selected is None:
-            building.remove(state_key)
-            return False
-
-        _metrics, choice = selected
-        if choice[0] == "close":
-            ok = _add_closure_strategy(sas_task, policy, state_key)
-            building.remove(state_key)
-            return ok
-
-        _kind, group_key, actions = choice
-        child = _extend_policy(sas_task, policy, state_key, group_key, actions)
-        if child is None:
-            building.remove(state_key)
-            return False
-
-        policy.pending = child.pending
-        policy.strategy = child.strategy
-        policy.terminal_goals = child.terminal_goals
-        policy.state_metrics = child.state_metrics
-
-        for action in actions:
-            successor = _cached_successor(sas_task, state_key, action)
-            if not build(successor):
-                building.remove(state_key)
-                return False
-
-        building.remove(state_key)
-        return True
-
-    if not build(initial_key):
-        return None
-
-    _prepare_policy_for_queue(sas_task, policy)
-    if not _policy_is_strong_acyclic_solution(sas_task, policy):
-        return None
-
-    values = evaluate_policy(sas_task, policy)
-    return SearchSolution(policy, values)
-
-
-# Handles the internal closure metrics for state step.
-def _closure_metrics_for_state(sas_task, state_key):
-    sas_state, numeric_state = state_key
-    utility = sas_task.utility_of_sas_state(sas_state)
-    loss = sas_task.max_utility - utility
-    cost = _numeric_cost(sas_task, numeric_state)
-    return StateMetrics(
-        cost_min=cost,
-        cost_max=cost,
-        loss_min=loss,
-        loss_max=loss,
-    )
-
-
-# Handles the internal metrics order key step.
-def _metrics_order_key(metrics, optimization_order):
-    values = {
-        "loss_max": metrics.loss_max,
-        "Cmax": metrics.cost_max,
-        "loss_min": metrics.loss_min,
-        "Cmin": metrics.cost_min,
-        "size": 0,
-    }
-    return _values_order_key(values, optimization_order)
-
-
-# Rounds value signature.
-def _rounded_value_signature(values):
-    return (
-        round(values["loss_max"], 9),
-        round(values["Cmax"], 9),
-        round(values["loss_min"], 9),
-        round(values["Cmin"], 9),
-    )
-
-
-# Handles the internal maximin utility seed solution step.
-def _maximin_utility_seed_solution(sas_task, optimization_order):
-    initial_key = sas_task.state_key(
-        sas_task.initial_state,
-        sas_task.numeric_initial_state,
-    )
-
-    # Solves the current state inside the local dynamic program.
-    @lru_cache(maxsize=None)
-    def solve(state_key):
-        if not _numeric_goal_bounds_hold(sas_task, state_key):
-            return -math.inf, None
-
-        best_value = -math.inf
-        best_choice = None
-
-        if _base_goal_satisfied(sas_task, state_key):
-            best_value = sas_task.utility_of_sas_state(state_key[0])
-            best_choice = ("close",)
-
-        for group_key, actions in _normal_action_groups(sas_task, state_key):
-            successor_values = []
-            valid = True
-            for action in actions:
-                successor = _cached_successor(sas_task, state_key, action)
-                if successor == state_key:
-                    valid = False
-                    break
-                value, _choice = solve(successor)
-                if value == -math.inf:
-                    valid = False
-                    break
-                successor_values.append(value)
-
-            if not valid or not successor_values:
-                continue
-
-            candidate_value = min(successor_values)
-            if candidate_value > best_value:
-                best_value = candidate_value
-                best_choice = ("act", group_key, tuple(actions))
-
-        return best_value, best_choice
-
-    value, choice = solve(initial_key)
-    if value == -math.inf or choice is None:
-        return None
-
-    policy = BasicPolicy.make_initial(initial_key)
-    building = set()
-
-    # Reconstructs the policy choices selected by the dynamic program.
-    def build(state_key):
-        if state_key in policy.strategy or sas_task.is_goal_state(*state_key):
-            return True
-        if state_key in building:
-            return False
-        building.add(state_key)
-
-        _value, selected = solve(state_key)
-        if selected is None:
-            building.remove(state_key)
-            return False
-
-        if selected[0] == "close":
-            ok = _add_closure_strategy(sas_task, policy, state_key)
-            building.remove(state_key)
-            return ok
-
-        _kind, group_key, actions = selected
-        child = _extend_policy(sas_task, policy, state_key, group_key, actions)
-        if child is None:
-            building.remove(state_key)
-            return False
-
-        policy.pending = child.pending
-        policy.strategy = child.strategy
-        policy.terminal_goals = child.terminal_goals
-        policy.state_metrics = child.state_metrics
-
-        for action in actions:
-            successor = _cached_successor(sas_task, state_key, action)
-            if not build(successor):
-                building.remove(state_key)
-                return False
-
-        building.remove(state_key)
-        return True
-
-    if not build(initial_key):
-        return None
-
-    _prepare_policy_for_queue(sas_task, policy)
-    if not _policy_is_strong_acyclic_solution(sas_task, policy):
-        return None
-
-    values = evaluate_policy(sas_task, policy)
-    return SearchSolution(policy, values)
-
-
-# Collects action groups.
-def _normal_action_groups(sas_task, state_key):
-    sas_state, numeric_state = state_key
-    groups = {}
-    for action in sas_task.actions:
-        if action.is_fictitious:
-            continue
-        if not sas_task.is_action_applicable(sas_state, numeric_state, action):
-            continue
-        key = _action_group_key(action)
-        groups.setdefault(key, []).append(action)
-    return sorted(groups.items(), key=lambda item: (min(action.index for action in item[1]), item[0]))
-
-
-# Adds closure strategy.
-def _add_closure_strategy(sas_task, policy, state_key):
-    current = state_key
-    while not sas_task.is_goal_state(*current):
-        applicable = [
-            action
-            for action in sas_task.actions
-            if action.is_fictitious
-            and sas_task.is_action_applicable(current[0], current[1], action)
-        ]
-        if not applicable:
-            return False
-
-        action = min(applicable, key=lambda candidate: candidate.index)
-        group_key = _action_group_key(action)
-        child = _extend_policy(sas_task, policy, current, group_key, (action,))
-        if child is None:
-            return False
-
-        successor = _cached_successor(sas_task, current, action)
-        policy.pending = child.pending
-        policy.strategy = child.strategy
-        policy.terminal_goals = child.terminal_goals
-        policy.state_metrics = child.state_metrics
-        current = successor
-
-    return True
 
 
 # Propagates cost and utility-loss metrics through a policy graph.
@@ -1537,19 +963,20 @@ def reachable_terminal_states(policy):
 def _policy_is_strong_acyclic_solution(sas_task, policy):
     if policy.pending:
         return False
-    if _has_reachable_strategy_cycle(policy):
+    if _has_reachable_strategy_cycle(sas_task, policy):
         return False
     return _policy_has_only_goal_terminals(sas_task, policy)
 
 
-# Checks whether the object has reachable strategy cycle.
-def _has_reachable_strategy_cycle(policy):
+# Checks for cycles over logical states, ignoring pure accumulated cost.
+def _has_reachable_strategy_cycle(sas_task, policy):
     visiting = set()
     visited = set()
 
     # Visits a state while detecting reachable strategy cycles.
     def visit(state):
-        if state in visiting:
+        logical_state = _logical_state_key(sas_task, state)
+        if logical_state in visiting:
             return True
         if state in visited:
             return False
@@ -1559,12 +986,12 @@ def _has_reachable_strategy_cycle(policy):
         if decision is None:
             return False
 
-        visiting.add(state)
+        visiting.add(logical_state)
         _group_key, outcomes = decision
         for _action, successor in outcomes:
             if visit(successor):
                 return True
-        visiting.remove(state)
+        visiting.remove(logical_state)
         return False
 
     return visit(policy.initial_state)
@@ -1802,12 +1229,28 @@ def _heuristic_value(sas_task, state_key, heuristic_cache, use_heuristics):
             "h_loss": 0.0,
             "h_goal": 0.0,
         }
-    cached = heuristic_cache.get(state_key)
+    cache_key = _heuristic_cache_key(sas_task, state_key)
+    cached = heuristic_cache.get(cache_key)
     if cached is not None:
         return cached
     value = sas_heuristics.evaluate_state(sas_task, state_key)
-    heuristic_cache[state_key] = value
+    heuristic_cache[cache_key] = value
     return value
+
+
+# Reuses Cmin heuristics across states that differ only in accumulated cost.
+def _heuristic_cache_key(sas_task, state_key):
+    if getattr(sas_task, "cost_bound_criterion", "Cmax") == "Cmin":
+        return _logical_state_key(sas_task, state_key)
+    return state_key
+
+
+# Returns the state identity relevant to planning decisions.
+def _logical_state_key(sas_task, state_key):
+    key_builder = getattr(sas_task, "logical_state_key", None)
+    if key_builder is None:
+        return state_key
+    return key_builder(state_key)
 
 
 # Handles the internal successor metrics step.

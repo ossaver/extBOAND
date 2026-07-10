@@ -19,7 +19,8 @@ def write_solution(
 
     lines = [
         f"Problem: {pname}",
-        f"Ordering: {','.join(ordering)}",
+        f"BOAND* objectives: {','.join(ordering[:2])}",
+        f"Open-list tie-breakers: {','.join(ordering[2:])}",
         f"Policy size: {len(result.policy.strategy)}",
         "Values:",
     ]

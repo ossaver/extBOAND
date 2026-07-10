@@ -1,7 +1,6 @@
 from pddl.action import Action
 from pddl.core import Domain
 from pddl.logic.base import OneOf
-from pddl.logic.base import And
 from pddl.requirements import Requirements
 from .normalizer import normalize
 
@@ -20,9 +19,6 @@ def determinize(domain: Domain) -> Domain:
         if isinstance(new_act.effect, OneOf):
             counter = 1
             for eff in new_act.effect.operands:
-                assert isinstance(
-                    eff, And
-                ), f"Effect in OneOf is not an AndEffect: {eff}"
                 new_actions.append(
                     Action(
                         name=f"{act.name}_DETDUP_{counter}",

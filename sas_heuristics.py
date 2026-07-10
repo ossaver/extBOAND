@@ -1,7 +1,7 @@
 import math
 import re
 
-from grounderTypes import Assignment, Comparator, GroundedNumericExpressionType
+from grounderTypes import Assignment, GroundedNumericExpressionType
 
 
 DETDUP_RE = re.compile(r"_DETDUP_\d+$")
@@ -13,7 +13,7 @@ IN_PROGRESS = object()
 # Computes all heuristic estimates used for a SAS state.
 def evaluate_state(sas_task, state_key):
     value_costs = relaxed_value_costs(sas_task, state_key)
-    remaining_budget = _goal_remaining_budget(sas_task, state_key)
+    remaining_budget = _remaining_budget(sas_task, state_key)
     guaranteed_utility = andor_guaranteed_utility(
         sas_task,
         state_key,
@@ -54,7 +54,7 @@ def andor_guaranteed_utility(sas_task, state_key, remaining_budget=None, depth=N
         setattr(sas_task, "_andor_heuristic_cache", cache)
 
     key = (
-        state_key,
+        _andor_cache_state_key(sas_task, state_key),
         _budget_cache_key(remaining_budget),
         depth,
     )
@@ -68,13 +68,29 @@ def andor_guaranteed_utility(sas_task, state_key, remaining_budget=None, depth=N
     if cached is not None:
         return cached
 
+    cycle_key = _andor_cycle_key(sas_task, state_key, remaining_budget)
+    active = _andor_active_cycles(sas_task, "_andor_utility_active")
+    if cycle_key in active:
+        return relaxed_utility_upper_bound(
+            sas_task,
+            state_key,
+            remaining_budget,
+        )
+
+    active.add(cycle_key)
     cache[key] = IN_PROGRESS
-    value = _compute_andor_guaranteed_utility(
-        sas_task,
-        state_key,
-        remaining_budget,
-        depth,
-    )
+    try:
+        value = _compute_andor_guaranteed_utility(
+            sas_task,
+            state_key,
+            remaining_budget,
+            depth,
+        )
+    except BaseException:
+        cache.pop(key, None)
+        raise
+    finally:
+        active.remove(cycle_key)
     cache[key] = value
     return value
 
@@ -178,7 +194,7 @@ def andor_guaranteed_goal_cost(
         setattr(sas_task, "_andor_cost_cache", cache)
 
     key = (
-        state_key,
+        _andor_cache_state_key(sas_task, state_key),
         _budget_cache_key(remaining_budget),
         depth,
     )
@@ -188,14 +204,26 @@ def andor_guaranteed_goal_cost(
     if cached is not None:
         return cached
 
+    cycle_key = _andor_cycle_key(sas_task, state_key, remaining_budget)
+    active = _andor_active_cycles(sas_task, "_andor_cost_active")
+    if cycle_key in active:
+        return _goal_cost_fallback(sas_task, state_key, fallback_cost)
+
+    active.add(cycle_key)
     cache[key] = IN_PROGRESS
-    value = _compute_andor_guaranteed_goal_cost(
-        sas_task,
-        state_key,
-        remaining_budget,
-        depth,
-        fallback_cost,
-    )
+    try:
+        value = _compute_andor_guaranteed_goal_cost(
+            sas_task,
+            state_key,
+            remaining_budget,
+            depth,
+            fallback_cost,
+        )
+    except BaseException:
+        cache.pop(key, None)
+        raise
+    finally:
+        active.remove(cycle_key)
     cache[key] = value
     return value
 
@@ -290,7 +318,7 @@ def andor_goal_cost_with_utility_target(
 
     target_key = round(target_utility, 9)
     key = (
-        state_key,
+        _andor_cache_state_key(sas_task, state_key),
         target_key,
         _budget_cache_key(remaining_budget),
         depth,
@@ -307,15 +335,33 @@ def andor_goal_cost_with_utility_target(
     if cached is not None:
         return cached
 
+    cycle_key = _andor_cycle_key(sas_task, state_key, remaining_budget)
+    active = _andor_active_cycles(sas_task, "_andor_conditional_active")
+    if cycle_key in active:
+        return _conditional_goal_cost_fallback(
+            sas_task,
+            state_key,
+            target_utility,
+            remaining_budget,
+            fallback_cost,
+        )
+
+    active.add(cycle_key)
     cache[key] = IN_PROGRESS
-    value = _compute_andor_goal_cost_with_utility_target(
-        sas_task,
-        state_key,
-        target_utility,
-        remaining_budget,
-        depth,
-        fallback_cost,
-    )
+    try:
+        value = _compute_andor_goal_cost_with_utility_target(
+            sas_task,
+            state_key,
+            target_utility,
+            remaining_budget,
+            depth,
+            fallback_cost,
+        )
+    except BaseException:
+        cache.pop(key, None)
+        raise
+    finally:
+        active.remove(cycle_key)
     cache[key] = value
     return value
 
@@ -483,6 +529,15 @@ def relaxed_goal_distance(sas_task, state_key, value_costs=None):
 
 # Computes relaxed reachability costs for SAS variable values.
 def relaxed_value_costs(sas_task, state_key):
+    cache = getattr(sas_task, "_relaxed_value_cost_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(sas_task, "_relaxed_value_cost_cache", cache)
+    cache_key = _logical_state_key(sas_task, state_key)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     sas_state, _numeric_state = state_key
     value_costs = {}
     for var_index, value_index in enumerate(sas_state):
@@ -518,6 +573,7 @@ def relaxed_value_costs(sas_task, state_key):
                     value_costs[key] = next_cost
                     changed = True
 
+    cache[cache_key] = value_costs
     return value_costs
 
 
@@ -736,97 +792,18 @@ def _numeric_goal_bounds_hold(sas_task, state_key):
     )
 
 
-# Handles the internal goal remaining budget step.
-def _goal_remaining_budget(sas_task, state_key):
+# Computes the remaining budget from the custom problem bound.
+def _remaining_budget(sas_task, state_key):
+    if getattr(sas_task, "cost_bound_criterion", "Cmax") == "Cmin":
+        return None
+
+    bound = getattr(sas_task, "cost_bound", None)
+    if bound is None:
+        return None
+
     _sas_state, numeric_state = state_key
     current_cost = _numeric_cost(sas_task, numeric_state)
-    limits = []
-
-    for goal in sas_task.goals:
-        for condition in goal.numeric_conditions:
-            limit = _extract_total_cost_upper_bound(sas_task, numeric_state, condition)
-            if limit is not None:
-                limits.append(limit)
-
-    if not limits:
-        return None
-
-    return min(limits) - current_cost
-
-
-# Extracts total cost upper bound.
-def _extract_total_cost_upper_bound(sas_task, numeric_state, condition):
-    if len(condition.terms) != 2:
-        return None
-
-    left, right = condition.terms
-    if (
-        condition.comparator == Comparator.CMP_LESS_EQ
-        and _numeric_expression_is_total_cost(sas_task, left)
-    ):
-        return _evaluate_numeric_expression(numeric_state, right, sas_task)
-
-    if (
-        condition.comparator == Comparator.CMP_GREATER_EQ
-        and _numeric_expression_is_total_cost(sas_task, right)
-    ):
-        return _evaluate_numeric_expression(numeric_state, left, sas_task)
-
-    return None
-
-
-# Handles the internal numeric expression is total cost step.
-def _numeric_expression_is_total_cost(sas_task, expression):
-    if expression.type != GroundedNumericExpressionType.GE_VAR:
-        return False
-    return _is_total_cost_var(sas_task, expression.index)
-
-
-# Evaluates numeric expression.
-def _evaluate_numeric_expression(numeric_state, expression, sas_task):
-    expression_type = expression.type
-
-    if expression_type == GroundedNumericExpressionType.GE_NUMBER:
-        return float(expression.value)
-
-    if expression_type == GroundedNumericExpressionType.GE_VAR:
-        pos = sas_task.numeric_var_to_pos[expression.index]
-        return numeric_state[pos]
-
-    if expression_type == GroundedNumericExpressionType.GE_SUM:
-        return sum(
-            _evaluate_numeric_expression(numeric_state, sub, sas_task)
-            for sub in expression.terms
-        )
-
-    if expression_type == GroundedNumericExpressionType.GE_SUB:
-        values = [
-            _evaluate_numeric_expression(numeric_state, sub, sas_task)
-            for sub in expression.terms
-        ]
-        if len(values) == 1:
-            return -values[0]
-        result = values[0]
-        for value in values[1:]:
-            result -= value
-        return result
-
-    if expression_type == GroundedNumericExpressionType.GE_MUL:
-        result = 1.0
-        for sub in expression.terms:
-            result *= _evaluate_numeric_expression(numeric_state, sub, sas_task)
-        return result
-
-    if expression_type == GroundedNumericExpressionType.GE_DIV:
-        values = [
-            _evaluate_numeric_expression(numeric_state, sub, sas_task)
-            for sub in expression.terms
-        ]
-        if len(values) != 2:
-            return math.inf
-        return values[0] / values[1]
-
-    return math.inf
+    return float(bound) - current_cost
 
 
 # Handles the internal numeric cost step.
@@ -842,3 +819,33 @@ def _budget_cache_key(remaining_budget):
     if remaining_budget is None:
         return None
     return round(remaining_budget, 9)
+
+
+# Identifies logical AND/OR cycles without treating accumulated cost as state.
+def _andor_cycle_key(sas_task, state_key, remaining_budget):
+    return (
+        _logical_state_key(sas_task, state_key),
+        _budget_cache_key(remaining_budget),
+    )
+
+
+# Uses logical state identity while budget remains a separate cache dimension.
+def _andor_cache_state_key(sas_task, state_key):
+    return _logical_state_key(sas_task, state_key)
+
+
+# Returns exact identity unless the task proves total-cost is a pure metric.
+def _logical_state_key(sas_task, state_key):
+    key_builder = getattr(sas_task, "logical_state_key", None)
+    if key_builder is None:
+        return state_key
+    return key_builder(state_key)
+
+
+# Returns the active logical states for one recursive AND/OR estimate.
+def _andor_active_cycles(sas_task, attribute):
+    active = getattr(sas_task, attribute, None)
+    if active is None:
+        active = set()
+        setattr(sas_task, attribute, active)
+    return active

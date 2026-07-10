@@ -58,9 +58,18 @@ class SASTask:
     mutex_literals: set = field(default_factory=set)
     utility_by_literal: dict = field(default_factory=dict)
     utility_by_sas_value: dict = field(default_factory=dict)
+    constant_utility: float = 0.0
     soft_goal_closure_vars: list = field(default_factory=list)
     max_utility: float = 0.0
     soft_goals_compiled: bool = False
+    cost_bound: float = None
+    cost_bound_criterion: str = "Cmax"
+    _total_cost_metric_only: object = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     # Builds a SAS state tuple from a propositional state.
     def state_from_propositional_state(self, state):
@@ -91,7 +100,7 @@ class SASTask:
 
     # Computes the utility currently achieved by a SAS state.
     def utility_of_sas_state(self, sas_state):
-        return sum(
+        return self.constant_utility + sum(
             self.utility_by_sas_value.get((var, value), 0.0)
             for var, value in enumerate(sas_state)
         )
@@ -148,6 +157,61 @@ class SASTask:
     def state_key(self, sas_state, numeric_state):
         return tuple(sas_state), tuple(numeric_state)
 
+    # Removes accumulated cost from state identity when it is a pure metric.
+    def logical_state_key(self, state_key):
+        sas_state, numeric_state = state_key
+        if not self.can_abstract_total_cost():
+            return tuple(sas_state), tuple(numeric_state)
+        logical_numeric = tuple(
+            value
+            for value, variable in zip(numeric_state, self.numeric_variables)
+            if str(variable.fncIndex) != "total-cost"
+        )
+        return tuple(sas_state), logical_numeric
+
+    # Checks that total-cost cannot affect applicability, goals, or dynamics.
+    def can_abstract_total_cost(self):
+        if self._total_cost_metric_only is not None:
+            return self._total_cost_metric_only
+
+        cost_indexes = {
+            variable.index
+            for variable in self.numeric_variables
+            if str(variable.fncIndex) == "total-cost"
+        }
+        if not cost_indexes:
+            self._total_cost_metric_only = False
+            return False
+
+        conditions = (
+            condition
+            for owner in (*self.goals, *self.actions)
+            for condition in owner.numeric_conditions
+        )
+        if any(
+            _numeric_condition_references_any(condition, cost_indexes)
+            for condition in conditions
+        ):
+            self._total_cost_metric_only = False
+            return False
+
+        for action in self.actions:
+            for effect in action.numeric_effects:
+                references_cost = _numeric_expression_references_any(
+                    effect.exp,
+                    cost_indexes,
+                )
+                if effect.varIndex in cost_indexes:
+                    if effect.assignment != Assignment.AS_INCREASE or references_cost:
+                        self._total_cost_metric_only = False
+                        return False
+                elif references_cost:
+                    self._total_cost_metric_only = False
+                    return False
+
+        self._total_cost_metric_only = True
+        return True
+
     # Formats the SAS task for debugging output.
     def to_string(self):
         lines = ["SAS variables:"]
@@ -198,7 +262,7 @@ def compile_soft_goals(sas_task):
         return sas_task
 
     utility_vars = _get_utility_vars(sas_task)
-    sas_task.max_utility = sum(
+    sas_task.max_utility = sas_task.constant_utility + sum(
         max(
             sas_task.utility_by_sas_value.get((var_index, value_index), 0.0)
             for value_index in range(len(sas_task.variables[var_index].values))
@@ -245,6 +309,7 @@ def compile_soft_goals(sas_task):
         variable.initial_value for variable in sas_task.variables
     )
     sas_task.soft_goals_compiled = True
+    sas_task._total_cost_metric_only = None
     return sas_task
 
 
@@ -319,6 +384,8 @@ class _SASTranslator:
         self._compute_mutex()
 
         sas_task = SASTask()
+        problem = getattr(self.grounder, "problem", None)
+        sas_task.cost_bound = getattr(problem, "bound", None)
         self._create_numeric_variables(sas_task)
         self._create_sas_variables(sas_task)
         self._translate_actions(sas_task)
@@ -491,6 +558,8 @@ class _SASTranslator:
             initial_value = true_initial[0]
         else:
             initial_value = len(values)
+
+        if SAS_NONE not in values:
             values.append(SAS_NONE)
 
         variable = SASVariable(
@@ -599,6 +668,9 @@ class _SASTranslator:
                 assignment,
             )
             if literal is None:
+                if _utility_assignment_true_in_initial(self.grounder, assignment):
+                    sas_task.constant_utility += float(assignment.value)
+                    continue
                 raise ValueError(f"Utility literal not found: {assignment}")
             sas_task.utility_by_literal[literal] = float(assignment.value)
 
@@ -733,6 +805,33 @@ def _find_literal_from_utility_assignment(task, grounder, assignment):
     return None
 
 
+# Checks whether a utility assignment is already true in the initial state.
+def _utility_assignment_true_in_initial(grounder, assignment):
+    if grounder is None:
+        return False
+
+    wanted = (
+        str(assignment.predicate),
+        tuple(str(arg) for arg in assignment.arguments),
+    )
+    problem = getattr(grounder, "problem", None)
+    init = getattr(problem, "init", ()) if problem is not None else ()
+
+    for fact in init:
+        if _fact_key(fact) == wanted:
+            return True
+    return False
+
+
+# Handles the internal fact key step.
+def _fact_key(fact):
+    predicate = getattr(fact, "name", None)
+    terms = getattr(fact, "terms", None)
+    if predicate is None or terms is None:
+        return None
+    return str(predicate), tuple(str(term) for term in terms)
+
+
 # Handles the internal param name step.
 def _param_name(grounder, param):
     if grounder is None:
@@ -763,6 +862,26 @@ def _check_numeric_conditions(numeric_state, conditions, sas_task):
     return all(
         _evaluate_numeric_condition(numeric_state, condition, sas_task)
         for condition in conditions
+    )
+
+
+# Checks whether a numeric condition reads any selected variable.
+def _numeric_condition_references_any(condition, variable_indexes):
+    return any(
+        _numeric_expression_references_any(term, variable_indexes)
+        for term in condition.terms
+    )
+
+
+# Checks whether a numeric expression reads any selected variable.
+def _numeric_expression_references_any(expression, variable_indexes):
+    if expression is None:
+        return False
+    if expression.type == GroundedNumericExpressionType.GE_VAR:
+        return expression.index in variable_indexes
+    return any(
+        _numeric_expression_references_any(term, variable_indexes)
+        for term in expression.terms
     )
 
 

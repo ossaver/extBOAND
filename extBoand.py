@@ -57,7 +57,8 @@ def build_sas_task(domain_file, problem_file, compile_soft_goals=False):
 def print_summary(domain, problem, grounded_task, sas_task, order):
     print(f"Domain: {domain.name}")
     print(f"Problem: {problem.name}")
-    print(f"Optimization order: {','.join(order)}")
+    print(f"BOAND* objectives: {','.join(order[:2])}")
+    print(f"Open-list tie-breakers: {','.join(order[2:])}")
     print("")
     print("Grounded task:")
     print(f"  variables: {len(grounded_task.variables)}")
@@ -71,6 +72,9 @@ def print_summary(domain, problem, grounded_task, sas_task, order):
     print(f"  goals:             {len(sas_task.goals)}")
     print(f"  initial state:     {sas_task.initial_state}")
     print(f"  numeric initial:   {sas_task.numeric_initial_state}")
+    print(f"  total-cost bound:  {sas_task.cost_bound}")
+    print(f"  bound criterion:   {sas_search._cost_bound_criterion(order)}")
+    print(f"  logical cost state: {sas_task.can_abstract_total_cost()}")
     print(f"  utilities:         {len(sas_task.utility_by_sas_value)}")
     print(f"  soft goals closed: {sas_task.soft_goals_compiled}")
     if sas_task.soft_goals_compiled:
@@ -100,11 +104,13 @@ def print_variables(sas_task):
 
 # Prints the utility assigned to each SAS variable-value pair.
 def print_utilities(sas_task):
-    if not sas_task.utility_by_sas_value:
+    if not sas_task.utility_by_sas_value and not sas_task.constant_utility:
         print("Utilities: none")
         return
 
     print("Utilities:")
+    if sas_task.constant_utility:
+        print(f"  constant: {sas_task.constant_utility}")
     for (var_index, value_index), utility in sorted(
         sas_task.utility_by_sas_value.items()
     ):
@@ -113,7 +119,7 @@ def print_utilities(sas_task):
         print(f"  {var_index}={value_index} ({value}): {utility}")
 
 
-# Prints the final search status and the Pareto solutions found.
+# Prints the final search status and the bi-objective Pareto solutions found.
 def print_search_result(result, use_heuristics):
     print("Policy search:")
     print(f"  heuristics: {use_heuristics}")
@@ -129,12 +135,9 @@ def print_search_result(result, use_heuristics):
     solutions = result.solutions or [
         SimpleNamespace(policy=result.policy, values=result.values)
     ]
-    certified = sum(1 for solution in solutions if getattr(solution, "certified", False))
-    print(f"  pareto solutions: {len(solutions)}")
-    print(f"  certified: {certified}")
+    print(f"  bi-objective Pareto solutions: {len(solutions)}")
     for index, solution in enumerate(solutions, 1):
         values = solution.values
-        marker = " certified" if getattr(solution, "certified", False) else ""
         print(
             f"    {index}: "
             f"Umin={values['Umin']} "
@@ -142,7 +145,6 @@ def print_search_result(result, use_heuristics):
             f"Umax={values['Umax']} "
             f"Cmin={values['Cmin']} "
             f"size={values['size']}"
-            f"{marker}"
         )
 
 
@@ -267,7 +269,7 @@ def make_anytime_solution_saver(domain, problem, sas_task, grounder, ordering):
 
 # Checks whether the BOAND result has already been written incrementally.
 def result_was_saved_anytime(result):
-    return len(result.solutions) == 1 and all(
+    return bool(result.solutions) and all(
         getattr(solution, "certified", False)
         for solution in result.solutions
     )
@@ -300,8 +302,9 @@ def parse_args():
         default=("Umin", "Cmax", "Umax", "Cmin"),
         metavar="Umin,Cmax,Umax,Cmin",
         help=(
-            "Ordering criteria for optimization. Provide exactly Umin, Cmax, "
-            "Umax and Cmin once each, separated by commas."
+            "BOAND* order. The first two criteria are the objectives and the "
+            "last two are only open-list tie-breakers. Provide exactly Umin, "
+            "Cmax, Umax and Cmin once each, separated by commas."
         ),
     )
     parser.add_argument(
@@ -344,7 +347,10 @@ def parse_args():
         "--num-solutions",
         type=int,
         default=None,
-        help="Maximum number of Pareto solutions to keep searching for.",
+        help=(
+            "Stop after this many bi-objective Pareto solutions. "
+            "The returned coverage set may be incomplete."
+        ),
     )
     parser.add_argument(
         "--no-heuristics",

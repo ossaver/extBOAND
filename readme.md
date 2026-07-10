@@ -9,19 +9,19 @@ This document describes how the planner implementation works. It does not aim to
 
 ## Objective
 
-`ExtBoand` is a planner for oversubscription FOND problems. The main input is a PDDL domain, a PDDL problem, and an additional `:utility` section in the problem. The output is a set of non-dominated policies according to four criteria:
+`ExtBoand` is a planner for oversubscription FOND problems. The main input is a PDDL domain, a PDDL problem, and an additional `:utility` section in the problem. BOAND* computes a Pareto coverage set for two objectives selected from four available metrics:
 
 ```text
 Umin, Cmax, Umax, Cmin
 ```
 
-The default optimization order is:
+The default order is:
 
 ```text
 Umin,Cmax,Umax,Cmin
 ```
 
-This order can be changed with:
+The first two positions are the bi-objective optimization criteria. The final two positions are used only as open-list tie-breakers. The order can be changed with:
 
 ```powershell
 python extBoand.py -o Umin,Cmax,Umax,Cmin
@@ -41,14 +41,14 @@ Available parameters:
 
 - `domain_file`: path to the PDDL domain.
 - `problem_file`: path to the PDDL problem.
-- `-o`, `--optimization-order`: defines the lexicographic optimization order. It must contain exactly `Umin`, `Cmax`, `Umax`, and `Cmin` once each, separated by commas. Default: `Umin,Cmax,Umax,Cmin`.
+- `-o`, `--optimization-order`: defines the two BOAND* objectives followed by two open-list tie-breakers. It must contain exactly `Umin`, `Cmax`, `Umax`, and `Cmin` once each, separated by commas. Default: `Umin,Cmax,Umax,Cmin`.
 - `--variables`: displays the generated SAS variables and their values.
 - `--actions`: displays the translated SAS actions.
 - `--compile-soft-goals`: forces the compilation of soft goals through dummy actions. When search is executed, this is enabled automatically.
 - `--no-search`: stops the program after parsing, grounding, and translation to SAS. It is useful for inspecting the task without planning.
 - `--max-expansions`: limits the number of policy expansions. If not specified, the search has no limit and continues until the open list is exhausted or the process is stopped externally.
 - `--search-algorithm`: selects the search algorithm. It accepts `boand`, `dfs`, and `bfs`. The normal value is `boand`.
-- `-n`, `--num-solutions`: limits the maximum number of Pareto solutions to find.
+- `-n`, `--num-solutions`: stops after the requested number of bi-objective Pareto solutions. The resulting coverage set may be incomplete.
 - `--no-heuristics`: disables the relaxed and AND-OR heuristics used to guide the search.
 - `--andor-depth`: sets a maximum depth for the AND-OR heuristic. If not specified, the depth is unbounded and relaxations are used as a fallback in cycles.
 - `--report-every`: controls how often progress is printed, measured in policies extracted from the open list. With `0`, these periodic messages are disabled.
@@ -79,7 +79,7 @@ extBoand.py
 The complete flow is:
 
 1. Read the PDDL domain and problem.
-2. Extract the `:utility` section.
+2. Extract the custom `:utility` and `:bound` sections.
 3. Ground the problem.
 4. Determinize non-deterministic actions.
 5. Translate the grounded task into a reduced SAS representation.
@@ -106,7 +106,7 @@ The specific parser is located in:
 pddl_utility_parser.py
 ```
 
-This module temporarily removes the `:utility` section before delegating to the standard problem parser, and then adds a list of utility assignments to the problem object.
+This module temporarily removes the `:utility` and `:bound` sections before delegating to the standard problem parser. If the problem has no hard goal, it adds `(:goal (and))` only to the temporary parser input. It then adds the utility assignments and integer cost bound to the parsed problem object.
 
 ## Translation to SAS
 
@@ -190,13 +190,13 @@ Umax = M - loss_min
 
 where `M` is the sum of the maximum possible utility of each useful variable.
 
-Pareto comparison is implemented as a minimization comparison over:
+All criteria are internally converted to minimization values:
 
 ```text
 loss_max, Cmax, loss_min, Cmin
 ```
 
-One policy dominates another if it does not worsen any of those components and improves at least one.
+Only the first two criteria from `-o` participate in Pareto dominance. The remaining criteria are computed and reported, but only break ties in the open list. Consequently, BOAND* returns one representative policy for each distinct non-dominated pair of objective values, not every combination of the other two metrics.
 
 ## Search
 
@@ -222,28 +222,19 @@ It builds partial policies. A partial policy contains:
 
 In each iteration:
 
-1. A partial policy is extracted from the open list.
-2. It is discarded if it is dominated by already accepted solutions.
+1. The policy with the lexicographically smallest fixed key is extracted from the open list.
+2. It is discarded when its second-objective bound `f2` is not lower than `q2` of the last accepted solution.
 3. If it has no pending states, the algorithm checks whether it is a strong acyclic solution.
 4. If it still has pending states, one state is selected and non-deterministic action groups are expanded.
 5. Each child is evaluated with heuristic bounds.
-6. Infeasible or dominated children are discarded.
+6. Infeasible children are discarded.
 7. The new partial policies are inserted into the open list.
 
-The search keeps a set of non-dominated solutions. When a new solution appears, any previously stored solutions dominated by it are removed.
+The second objective of the last solution starts at infinity. The fixed lexicographic order guarantees that accepted solutions have strictly increasing first-objective values and strictly decreasing second-objective values. Therefore, the last solution has the best `q2` found so far and the dominance check is constant time.
 
 ## Exploration Order
 
-The first solution is searched for by following the optimization order specified by the user. Afterwards, selection orders are alternated to better cover the Pareto front and avoid spending too much time in a single corner of the search space.
-
-Initial seeds are also generated for several relevant corners of the front:
-
-- The best policy according to the main order.
-- A policy oriented toward `Cmax`.
-- A policy oriented toward `Cmin`.
-- A policy oriented toward `Umax`.
-
-These seeds make it possible to find low-cost policies early, which would otherwise be delayed for a long time under a purely lexicographic order.
+The same lexicographic order is used for every extraction. The first two key components are the BOAND* objectives; the third and fourth metrics, followed by policy size and insertion order, only resolve ties. No out-of-order seed solutions or alternating extraction orders are used because they would invalidate the constant-time `q2` dominance check.
 
 ## Heuristics
 
@@ -274,27 +265,25 @@ h_cmin
 There is an important distinction between:
 
 - `h_cmax`: the cost used for ordering when we want to maintain a certain utility.
-- `h_cmax_unconditional`: the cost used to check feasibility with respect to the budget.
+- `h_cmax_unconditional`: the worst-case cost used to check budget feasibility when `Cmax` appears before `Cmin`.
 
 This separation prevents pruning lower-utility but better-cost policies merely because they could not maintain the same utility level as another policy.
 
+When `total-cost` is only an accumulated metric, it is excluded from logical state identity for cycle detection and heuristic memoization. The accumulated value is still retained for `Cmin`, `Cmax`, and budget calculations. Remaining budget stays in the AND/OR cache key, so states with different budget capacity are not merged. This abstraction is disabled automatically if `total-cost` appears in an action or goal condition, affects another numeric fluent, or is modified by anything other than an increment.
+
 ## Budget
 
-If the goal contains a restriction on `total-cost`, for example:
+The total-cost limit is specified as a custom top-level problem section:
 
 ```lisp
-(<= (total-cost) (budget))
+(:bound 20)
 ```
 
-the search extracts that limit and uses it as a cost bound. Budget pruning uses the unconditional cost (`Cmax_budget`) so as not to eliminate valid policies that give up utility.
+The custom parser removes this section before invoking the standard PDDL parser and stores its integer value in the SAS task. The bound applies to whichever cost criterion appears first in `-o`. If `Cmax` appears first, every trajectory must respect the bound and pruning uses the unconditional worst-case cost (`Cmax_budget`). If `Cmin` appears first, only the best-case trajectory must respect the bound; trajectories above the bound remain valid as long as the policy's `Cmin` does not exceed it.
 
-## Solution Certification
+## Solution Guarantees
 
-A solution can appear before the open list is exhausted. At that point, it is a valid solution and is saved incrementally.
-
-A solution is marked as certified when the open list no longer contains any bound that could dominate it. If the search terminates because `--max-expansions` is reached, there may be valid solutions that are not yet certified.
-
-If the open list is exhausted, all remaining solutions are marked as certified.
+With admissible and goal-aware objective bounds, every solution accepted by BOAND* is already Pareto-optimal for the selected objective pair and is saved incrementally. Exhausting the open list computes the complete Pareto coverage set. Stopping with `--max-expansions` or `--num-solutions` preserves the optimality of accepted solutions but returns incomplete coverage.
 
 ## Outputs
 

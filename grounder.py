@@ -870,11 +870,8 @@ class Grounder:
     
     # Creates grounded variables and numeric values from the initial state.
     def initInitialState(self):
-        self.object_list = list(self.problem.objects)
-        self.object_to_index = {
-            getattr(obj, "name", str(obj)): i
-            for i, obj in enumerate(self.object_list)
-        }
+        if not self.object_list:
+            self.initObjects()
     
         self.newValues = []
         self.auxValues = []
