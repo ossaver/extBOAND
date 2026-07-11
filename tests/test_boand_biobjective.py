@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import sas_search
+from sas import SASCondition, SASTranslatedAction
 
 
 ORDER = ("Umin", "Cmax", "Umax", "Cmin")
@@ -89,6 +90,107 @@ class BiObjectiveHelperTests(unittest.TestCase):
                 exact,
                 ORDER[:2],
             )
+
+    def test_incumbent_pruning_uses_safe_utility_bound(self):
+        incumbent = sas_search.SearchSolution(
+            policy=object(),
+            values=values(186.0, 0.0),
+        )
+        misleading_bound = values(198.0, 1.0, tie1=0.0)
+
+        self.assertFalse(
+            sas_search._bound_dominated_by_incumbent(
+                misleading_bound,
+                [incumbent],
+                ORDER[:2],
+            )
+        )
+
+        safely_dominated = values(198.0, 1.0, tie1=200.0)
+        self.assertTrue(
+            sas_search._bound_dominated_by_incumbent(
+                safely_dominated,
+                [incumbent],
+                ORDER[:2],
+            )
+        )
+
+    def test_bootstrap_is_returned_as_uncertified_on_early_stop(self):
+        bootstrap = sas_search.SearchSolution(
+            policy=object(),
+            values=values(5.0, 2.0),
+        )
+
+        merged = sas_search._merge_bootstrap_solution(
+            [],
+            bootstrap,
+            ORDER[:2],
+            certified=False,
+        )
+
+        self.assertEqual(merged, [bootstrap])
+        self.assertFalse(bootstrap.certified)
+
+    def test_incumbent_set_compares_only_primary_exact_objectives(self):
+        old = sas_search.SearchSolution(
+            policy=object(),
+            values=values(10.0, 2.0, tie1=0.0),
+        )
+        better_umin = sas_search.SearchSolution(
+            policy=object(),
+            values=values(5.0, 2.0, tie1=20.0),
+        )
+
+        updated = sas_search._update_incumbents(
+            [old],
+            better_umin,
+            ORDER[:2],
+        )
+
+        self.assertEqual(updated, [better_umin])
+
+    def test_soft_goals_close_in_one_canonical_order(self):
+        task = type("ClosureTask", (), {"soft_goal_closure_vars": [2, 3]})()
+        normal = SASTranslatedAction(index=0, name="move")
+        close_first = SASTranslatedAction(
+            index=1,
+            name="close-v2",
+            effects=(SASCondition(2, 1),),
+            is_fictitious=True,
+        )
+        close_second = SASTranslatedAction(
+            index=2,
+            name="close-v3",
+            effects=(SASCondition(3, 1),),
+            is_fictitious=True,
+        )
+
+        all_open = (0, 0, 0, 0)
+        self.assertTrue(
+            sas_search._canonical_closure_action_allowed(task, all_open, normal)
+        )
+        self.assertTrue(
+            sas_search._canonical_closure_action_allowed(
+                task, all_open, close_first
+            )
+        )
+        self.assertFalse(
+            sas_search._canonical_closure_action_allowed(
+                task, all_open, close_second
+            )
+        )
+
+        closure_started = (0, 0, 1, 0)
+        self.assertFalse(
+            sas_search._canonical_closure_action_allowed(
+                task, closure_started, normal
+            )
+        )
+        self.assertTrue(
+            sas_search._canonical_closure_action_allowed(
+                task, closure_started, close_second
+            )
+        )
 
 
 class BiObjectiveSearchTests(unittest.TestCase):

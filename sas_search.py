@@ -256,6 +256,35 @@ def boand_star_policy_search(
     max_open = 0
     iterations = 0
     start_time = time.time()
+    bootstrap_solution = _bootstrap_feasible_solution(
+        sas_task,
+        optimization_order,
+        max_expansions=1000,
+        use_heuristics=use_heuristics,
+    )
+    incumbents = [bootstrap_solution] if bootstrap_solution is not None else []
+    anytime_solution_offset = 0
+
+    if bootstrap_solution is not None:
+        print(
+            "Bootstrap feasible solution: "
+            + _format_order_values(bootstrap_solution.values, optimization_order)
+            + f" size={len(bootstrap_solution.policy.strategy)}",
+            flush=True,
+        )
+        if on_solution is not None:
+            on_solution(
+                bootstrap_solution,
+                1,
+                {
+                    "iterations": 0,
+                    "expansions": 0,
+                    "generated": 1,
+                    "max_open": 0,
+                    "elapsed_time": time.time() - start_time,
+                },
+            )
+            anytime_solution_offset = 1
 
     _ensure_search_caches(sas_task)
 
@@ -320,6 +349,12 @@ def boand_star_policy_search(
 
         if _violates_total_cost_bound(sas_task, f_values):
             continue
+        if _bound_dominated_by_incumbent(
+            f_values,
+            incumbents,
+            objective_order,
+        ):
+            continue
         if _bound_pruned_by_last_solution(f_values, objective_order, q2_last):
             continue
 
@@ -329,6 +364,15 @@ def boand_star_policy_search(
             if _policy_is_strong_acyclic_solution(sas_task, policy):
                 values = evaluate_policy(sas_task, policy)
                 if _violates_total_cost_bound(sas_task, values):
+                    continue
+                if any(
+                    _solution_values_dominate(
+                        incumbent.values,
+                        values,
+                        objective_order,
+                    )
+                    for incumbent in incumbents
+                ):
                     continue
                 _require_goal_aware_objectives(
                     f_values,
@@ -342,6 +386,11 @@ def boand_star_policy_search(
                     certified=True,
                 )
                 solutions.append(accepted)
+                incumbents = _update_incumbents(
+                    incumbents,
+                    accepted,
+                    objective_order,
+                )
                 _print_solution_progress(
                     values,
                     optimization_order,
@@ -354,7 +403,7 @@ def boand_star_policy_search(
                 if on_solution is not None:
                     on_solution(
                         accepted,
-                        len(solutions),
+                        len(solutions) + anytime_solution_offset,
                         {
                             "iterations": iterations,
                             "expansions": expansions,
@@ -381,8 +430,14 @@ def boand_star_policy_search(
                 f"max expansions reached ({max_expansions}); "
                 "Pareto coverage is incomplete"
             )
-            return _make_front_result(
+            partial_solutions = _merge_bootstrap_solution(
                 solutions,
+                bootstrap_solution,
+                objective_order,
+                certified=False,
+            )
+            return _make_front_result(
+                partial_solutions,
                 expansions,
                 generated,
                 max_open,
@@ -424,6 +479,12 @@ def boand_star_policy_search(
                 continue
             if _violates_total_cost_bound(sas_task, child_f):
                 continue
+            if _bound_dominated_by_incumbent(
+                child_f,
+                incumbents,
+                objective_order,
+            ):
+                continue
 
             signature = policy_signature(child)
             if signature in seen:
@@ -442,6 +503,12 @@ def boand_star_policy_search(
                 ),
             )
 
+    solutions = _merge_bootstrap_solution(
+        solutions,
+        bootstrap_solution,
+        objective_order,
+        certified=True,
+    )
     return _make_front_result(
         solutions,
         expansions,
@@ -739,6 +806,109 @@ def _cost_bound_criterion(optimization_order):
 def _configure_cost_bound_criterion(sas_task, optimization_order):
     sas_task.cost_bound_criterion = _cost_bound_criterion(
         tuple(optimization_order)
+    )
+
+
+# Finds a quick feasible policy used only as a dominance incumbent.
+def _bootstrap_feasible_solution(
+    sas_task,
+    optimization_order,
+    max_expansions,
+    use_heuristics,
+):
+    if not getattr(sas_task, "soft_goals_compiled", False):
+        return None
+
+    result = depth_first_and_or_search(
+        sas_task,
+        max_expansions=max_expansions,
+        optimization_order=optimization_order,
+        use_heuristics=use_heuristics,
+    )
+    if not result.found or _violates_total_cost_bound(sas_task, result.values):
+        return None
+    return SearchSolution(result.policy, result.values, certified=False)
+
+
+# Checks whether a feasible incumbent weakly dominates an optimistic bound.
+def _bound_dominated_by_incumbent(bound, incumbents, objective_order):
+    return any(
+        all(
+            _criterion_min_value(incumbent.values, criterion)
+            <= _safe_dominance_bound_value(bound, criterion) + EPS
+            for criterion in objective_order
+        )
+        for incumbent in incumbents
+    )
+
+
+# Returns a conservative optimistic value suitable for incumbent pruning.
+def _safe_dominance_bound_value(bound, criterion):
+    if criterion == "Umin":
+        # The guaranteed-utility heuristic can stop at an already satisfied
+        # base goal.  loss_min is the relaxed best-outcome loss and is therefore
+        # a safe lower bound for every descendant's worst-outcome loss.
+        return bound["loss_min"]
+    if criterion == "Cmax":
+        return bound.get("Cmax_budget", bound["Cmax"])
+    return _criterion_min_value(bound, criterion)
+
+
+# Maintains the nondominated feasible incumbent set.
+def _update_incumbents(incumbents, candidate, objective_order):
+    if any(
+        _solution_values_dominate(
+            incumbent.values,
+            candidate.values,
+            objective_order,
+        )
+        for incumbent in incumbents
+    ):
+        return incumbents
+
+    return [
+        incumbent
+        for incumbent in incumbents
+        if not _solution_values_dominate(
+            candidate.values,
+            incumbent.values,
+            objective_order,
+        )
+    ] + [candidate]
+
+
+# Compares two complete feasible objective vectors.
+def _solution_values_dominate(left, right, objective_order):
+    return all(
+        _criterion_min_value(left, criterion)
+        <= _criterion_min_value(right, criterion) + EPS
+        for criterion in objective_order
+    )
+
+
+# Adds the bootstrap policy to the returned Pareto set when it remains relevant.
+def _merge_bootstrap_solution(
+    solutions,
+    bootstrap_solution,
+    objective_order,
+    certified,
+):
+    if bootstrap_solution is None:
+        return solutions
+
+    merged = _update_incumbents(
+        list(solutions),
+        bootstrap_solution,
+        objective_order,
+    )
+    if bootstrap_solution in merged:
+        bootstrap_solution.certified = certified
+    return sorted(
+        merged,
+        key=lambda solution: tuple(
+            _criterion_min_value(solution.values, criterion)
+            for criterion in objective_order
+        ),
     )
 
 
@@ -1072,6 +1242,8 @@ def _cached_applicable_action_groups(sas_task, state_key):
     for action in sas_task.actions:
         if action.is_fictitious and not base_goal_satisfied:
             continue
+        if not _canonical_closure_action_allowed(sas_task, sas_state, action):
+            continue
         if not sas_task.is_action_applicable(sas_state, numeric_state, action):
             continue
         key = _action_group_key(action)
@@ -1083,6 +1255,31 @@ def _cached_applicable_action_groups(sas_task, state_key):
     )
     sas_task._applicable_group_cache[state_key] = cached
     return cached
+
+
+# Removes equivalent permutations of the compiled soft-goal closure phase.
+def _canonical_closure_action_allowed(sas_task, sas_state, action):
+    closure_vars = tuple(getattr(sas_task, "soft_goal_closure_vars", ()))
+    if not closure_vars:
+        return True
+
+    open_vars = [var for var in closure_vars if sas_state[var] == 0]
+    closure_started = len(open_vars) < len(closure_vars)
+
+    if not action.is_fictitious:
+        # Once one utility has been frozen, closure is an atomic terminal phase.
+        return not closure_started
+
+    if not open_vars:
+        return False
+
+    # All closure actions commute.  Closing the first open variable gives one
+    # canonical representative for every equivalent permutation.
+    next_var = open_vars[0]
+    return any(
+        effect.var == next_var and effect.value == 1
+        for effect in action.effects
+    )
 
 
 # Handles the internal extend policy step.
