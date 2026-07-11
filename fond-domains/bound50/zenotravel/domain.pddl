@@ -2,6 +2,7 @@
 (:requirements
     :strips
     :typing
+    :universal-preconditions
     :non-deterministic
     :fluents
 	:action-costs

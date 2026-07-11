@@ -5,6 +5,7 @@
 (:requirements
     :strips
     :typing
+    :equality
     :non-deterministic
     :fluents
 	:action-costs

@@ -1,5 +1,5 @@
 from collections import defaultdict
-from pddl.logic.base import Not, And
+from pddl.logic.base import Not, And, ForallCondition
 from pddl.logic.predicates import Predicate
 from pddl.logic.functions import NumericFunction, NumericValue
 from pddl.logic.terms import Variable, Constant
@@ -692,9 +692,50 @@ class Grounder:
                 num_pre.extend(sub_num)
                 eq_pre.extend(sub_eq)
             return bool_pre, num_pre, eq_pre
+
+        if isinstance(cond, ForallCondition):
+            variables = sorted(cond.variables, key=lambda variable: variable.name)
+            if len(variables) != 1 or not isinstance(cond.condition, And):
+                raise NotImplementedError(
+                    "Solo se soportan precondiciones forall con una variable "
+                    "tipada y cuerpo conjuntivo."
+                )
+
+            variable = variables[0]
+            required_types = self._get_parameter_types(variable)
+            for object_index, obj in enumerate(self.objects):
+                if not self.objectIsCompatible(object_index, required_types):
+                    continue
+                # pddl 0.4.8 keeps the type on the quantified declaration but
+                # may represent occurrences in the body as untyped Variables.
+                mapping = {
+                    variable: obj,
+                    Variable(variable.name): obj,
+                }
+                instantiated = cond.condition.instantiate(mapping)
+                sub_bool, sub_num, sub_eq = self._extract_preconditions(
+                    instantiated,
+                    action,
+                )
+                bool_pre.extend(sub_bool)
+                num_pre.extend(sub_num)
+                eq_pre.extend(sub_eq)
+            return bool_pre, num_pre, eq_pre
     
-        if self._is_term_equality_condition(cond):
-            eq_pre.append(self._condition_to_op_equality(cond, action))
+        equality_cond = cond
+        equality_negated = False
+        if isinstance(cond, Not) and self._is_term_equality_condition(cond.argument):
+            equality_cond = cond.argument
+            equality_negated = True
+
+        if self._is_term_equality_condition(equality_cond):
+            eq_pre.append(
+                self._condition_to_op_equality(
+                    equality_cond,
+                    action,
+                    negated=equality_negated,
+                )
+            )
         elif self._is_numeric_condition(cond):
             num_pre.append(self._condition_to_grounded_numeric_condition(cond, action))
         else:
@@ -803,7 +844,7 @@ class Grounder:
         }
     
     # Converts to op equality.
-    def _condition_to_op_equality(self, cond, action):
+    def _condition_to_op_equality(self, cond, action, negated=False):
         left, right = self._get_binary_operands(cond)
         param_index = self._build_action_param_index(action)
     
@@ -813,7 +854,7 @@ class Grounder:
         return OpEquality(
             value1=value1,
             value2=value2,
-            equal=(cond.__class__.__name__ == "EqualTo"),
+            equal=(cond.__class__.__name__ == "EqualTo") != negated,
         )
     
     # Returns comparator.
