@@ -270,7 +270,7 @@ def make_anytime_solution_saver(domain, problem, sas_task, grounder, ordering):
 # Checks whether the BOAND result has already been written incrementally.
 def result_was_saved_anytime(result):
     return bool(result.solutions) and all(
-        getattr(solution, "certified", False)
+        getattr(solution, "saved_anytime", False)
         for solution in result.solutions
     )
 
@@ -360,10 +360,11 @@ def parse_args():
     parser.add_argument(
         "--andor-depth",
         type=int,
-        default=None,
+        default=2,
         help=(
             "Depth limit for the relaxed AND-OR guaranteed-utility heuristic. "
-            "By default it is unbounded and falls back to the relaxed graph on cycles."
+            "The default is 2; at the limit it falls back to the admissible "
+            "relaxed utility upper bound."
         ),
     )
     parser.add_argument(

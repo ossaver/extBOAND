@@ -115,7 +115,7 @@ class BiObjectiveHelperTests(unittest.TestCase):
             )
         )
 
-    def test_bootstrap_is_returned_as_uncertified_on_early_stop(self):
+    def test_bootstrap_can_remain_internal_and_uncertified(self):
         bootstrap = sas_search.SearchSolution(
             policy=object(),
             values=values(5.0, 2.0),
@@ -130,6 +130,7 @@ class BiObjectiveHelperTests(unittest.TestCase):
 
         self.assertEqual(merged, [bootstrap])
         self.assertFalse(bootstrap.certified)
+        self.assertFalse(bootstrap.saved_anytime)
 
     def test_incumbent_set_compares_only_primary_exact_objectives(self):
         old = sas_search.SearchSolution(

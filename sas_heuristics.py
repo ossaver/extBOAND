@@ -5,7 +5,7 @@ from grounderTypes import Assignment, GroundedNumericExpressionType
 
 
 DETDUP_RE = re.compile(r"_DETDUP_\d+$")
-DEFAULT_ANDOR_DEPTH = None
+DEFAULT_ANDOR_DEPTH = 2
 EPS = 1e-9
 IN_PROGRESS = object()
 
@@ -28,21 +28,13 @@ def evaluate_state(sas_task, state_key):
         depth=DEFAULT_ANDOR_DEPTH,
         fallback_cost=relaxed_goal,
     )
-    conditional_cost = andor_goal_cost_with_utility_target(
-        sas_task,
-        state_key,
-        target_utility=guaranteed_utility,
-        remaining_budget=remaining_budget,
-        depth=DEFAULT_ANDOR_DEPTH,
-        fallback_cost=relaxed_goal,
-    )
     return {
         "h_loss": max(0.0, sas_task.max_utility - guaranteed_utility),
         "h_loss_min": relaxed_utility_loss(sas_task, state_key, value_costs),
-        "h_cmax": max(guaranteed_cost, conditional_cost),
+        "h_cmax": guaranteed_cost,
         "h_cmax_unconditional": guaranteed_cost,
         "h_cmin": relaxed_goal,
-        "h_goal": max(guaranteed_cost, conditional_cost),
+        "h_goal": guaranteed_cost,
     }
 
 
@@ -105,7 +97,9 @@ def _compute_andor_guaranteed_utility(
     if remaining_budget is not None and remaining_budget < -EPS:
         return -math.inf
 
-    if _base_goal_satisfied(sas_task, state_key):
+    base_goal_satisfied = _base_goal_satisfied(sas_task, state_key)
+    soft_goals_compiled = getattr(sas_task, "soft_goals_compiled", False)
+    if base_goal_satisfied and not soft_goals_compiled:
         return sas_task.utility_of_sas_state(state_key[0])
 
     if depth is not None and depth <= 0:
@@ -117,13 +111,22 @@ def _compute_andor_guaranteed_utility(
 
     groups = _nondeterministic_successor_groups(sas_task, state_key)
     if not groups:
+        if base_goal_satisfied:
+            return sas_task.utility_of_sas_state(state_key[0])
         return relaxed_utility_upper_bound(
             sas_task,
             state_key,
             remaining_budget,
         )
 
-    best_action_value = -math.inf
+    # With compiled soft goals, satisfying the base goal means that stopping is
+    # possible, not mandatory.  Continuing with ordinary actions may improve
+    # guaranteed utility before the canonical closure phase begins.
+    best_action_value = (
+        sas_task.utility_of_sas_state(state_key[0])
+        if base_goal_satisfied
+        else -math.inf
+    )
     current_cost = _numeric_cost(sas_task, state_key[1])
 
     for successors in groups.values():
@@ -379,7 +382,9 @@ def _compute_andor_goal_cost_with_utility_target(
         return math.inf
 
     current_utility = sas_task.utility_of_sas_state(state_key[0])
-    if _base_goal_satisfied(sas_task, state_key):
+    base_goal_satisfied = _base_goal_satisfied(sas_task, state_key)
+    soft_goals_compiled = getattr(sas_task, "soft_goals_compiled", False)
+    if base_goal_satisfied and not soft_goals_compiled:
         if current_utility + EPS >= target_utility:
             return 0.0
         return math.inf
@@ -395,6 +400,8 @@ def _compute_andor_goal_cost_with_utility_target(
 
     groups = _nondeterministic_successor_groups(sas_task, state_key)
     if not groups:
+        if base_goal_satisfied and current_utility + EPS >= target_utility:
+            return 0.0
         return _conditional_goal_cost_fallback(
             sas_task,
             state_key,
@@ -404,7 +411,13 @@ def _compute_andor_goal_cost_with_utility_target(
         )
 
     current_cost = _numeric_cost(sas_task, state_key[1])
-    best_action_cost = math.inf
+    # In compiled oversubscription tasks, a base-goal state can either close
+    # now or keep acting to reach the requested utility before closure.
+    best_action_cost = (
+        0.0
+        if base_goal_satisfied and current_utility + EPS >= target_utility
+        else math.inf
+    )
     next_depth = None if depth is None else depth - 1
 
     for successors in groups.values():

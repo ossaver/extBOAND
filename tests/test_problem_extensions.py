@@ -216,6 +216,113 @@ class CostBoundConsumerTests(unittest.TestCase):
 
         self.assertEqual(value, 7.0)
 
+    def test_soft_goal_base_state_uses_optimistic_utility_at_depth_limit(self):
+        task = SimpleNamespace(
+            soft_goals_compiled=True,
+        )
+        state = ((0,), ())
+
+        with (
+            patch.object(
+                sas_heuristics,
+                "_base_goal_satisfied",
+                return_value=True,
+            ),
+            patch.object(
+                sas_heuristics,
+                "relaxed_utility_upper_bound",
+                return_value=100.0,
+            ),
+        ):
+            value = sas_heuristics._compute_andor_guaranteed_utility(
+                task,
+                state,
+                remaining_budget=10.0,
+                depth=0,
+            )
+
+        self.assertEqual(value, 100.0)
+
+    def test_soft_goal_base_state_can_continue_for_utility_target(self):
+        task = SimpleNamespace(
+            soft_goals_compiled=True,
+            utility_of_sas_state=lambda _state: 40.0,
+        )
+        state = ((0,), ())
+
+        with (
+            patch.object(
+                sas_heuristics,
+                "_base_goal_satisfied",
+                return_value=True,
+            ),
+            patch.object(
+                sas_heuristics,
+                "relaxed_utility_upper_bound",
+                return_value=100.0,
+            ),
+        ):
+            value = sas_heuristics._compute_andor_goal_cost_with_utility_target(
+                task,
+                state,
+                target_utility=100.0,
+                remaining_budget=10.0,
+                depth=0,
+                fallback_cost=3.0,
+            )
+
+        self.assertEqual(value, 3.0)
+
+    def test_cmax_bound_does_not_condition_on_optimistic_utility(self):
+        task = SimpleNamespace(
+            max_utility=100.0,
+        )
+        state = ((0,), ())
+
+        with (
+            patch.object(
+                sas_heuristics,
+                "relaxed_value_costs",
+                return_value={},
+            ),
+            patch.object(
+                sas_heuristics,
+                "_remaining_budget",
+                return_value=10.0,
+            ),
+            patch.object(
+                sas_heuristics,
+                "andor_guaranteed_utility",
+                return_value=90.0,
+            ),
+            patch.object(
+                sas_heuristics,
+                "relaxed_goal_distance",
+                return_value=1.0,
+            ),
+            patch.object(
+                sas_heuristics,
+                "andor_guaranteed_goal_cost",
+                return_value=2.0,
+            ),
+            patch.object(
+                sas_heuristics,
+                "andor_goal_cost_with_utility_target",
+                side_effect=AssertionError(
+                    "conditional utility cost must not enter the Cmax bound"
+                ),
+            ),
+            patch.object(
+                sas_heuristics,
+                "relaxed_utility_loss",
+                return_value=0.0,
+            ),
+        ):
+            value = sas_heuristics.evaluate_state(task, state)
+
+        self.assertEqual(value["h_loss"], 10.0)
+        self.assertEqual(value["h_cmax"], 2.0)
+
     def test_logical_state_key_ignores_only_pure_total_cost(self):
         task = sas.SASTask(
             numeric_variables=[

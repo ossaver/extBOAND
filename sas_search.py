@@ -29,6 +29,7 @@ class SearchSolution:
     policy: object
     values: dict
     certified: bool = False
+    saved_anytime: bool = False
 
 
 @dataclass
@@ -263,28 +264,13 @@ def boand_star_policy_search(
         use_heuristics=use_heuristics,
     )
     incumbents = [bootstrap_solution] if bootstrap_solution is not None else []
-    anytime_solution_offset = 0
-
     if bootstrap_solution is not None:
         print(
-            "Bootstrap feasible solution: "
+            "Bootstrap incumbent (feasible, not Pareto-certified): "
             + _format_order_values(bootstrap_solution.values, optimization_order)
             + f" size={len(bootstrap_solution.policy.strategy)}",
             flush=True,
         )
-        if on_solution is not None:
-            on_solution(
-                bootstrap_solution,
-                1,
-                {
-                    "iterations": 0,
-                    "expansions": 0,
-                    "generated": 1,
-                    "max_open": 0,
-                    "elapsed_time": time.time() - start_time,
-                },
-            )
-            anytime_solution_offset = 1
 
     _ensure_search_caches(sas_task)
 
@@ -403,7 +389,7 @@ def boand_star_policy_search(
                 if on_solution is not None:
                     on_solution(
                         accepted,
-                        len(solutions) + anytime_solution_offset,
+                        len(solutions),
                         {
                             "iterations": iterations,
                             "expansions": expansions,
@@ -412,6 +398,7 @@ def boand_star_policy_search(
                             "elapsed_time": time.time() - start_time,
                         },
                     )
+                    accepted.saved_anytime = True
                 if max_solutions is not None and len(solutions) >= max_solutions:
                     return _make_front_result(
                         solutions,
@@ -430,14 +417,8 @@ def boand_star_policy_search(
                 f"max expansions reached ({max_expansions}); "
                 "Pareto coverage is incomplete"
             )
-            partial_solutions = _merge_bootstrap_solution(
-                solutions,
-                bootstrap_solution,
-                objective_order,
-                certified=False,
-            )
             return _make_front_result(
-                partial_solutions,
+                solutions,
                 expansions,
                 generated,
                 max_open,
