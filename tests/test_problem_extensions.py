@@ -56,6 +56,25 @@ class ProblemExtensionParserTests(unittest.TestCase):
         self.assertEqual(problem.bound, 17)
         self.assertEqual(len(problem.utility), 1)
         self.assertEqual(problem.utility[0].value, 5.0)
+        self.assertFalse(problem.utility[0].negated)
+
+    def test_negated_utility_literal_is_parsed(self):
+        problem, _parser_input = self.parse_text(
+            """
+            (define (problem sample)
+                (:domain sample)
+                (:init (is-target p1))
+                (:utility (= (not (is-target p1)) 16))
+            )
+            """
+        )
+
+        self.assertEqual(len(problem.utility), 1)
+        assignment = problem.utility[0]
+        self.assertEqual(assignment.predicate, "is-target")
+        self.assertEqual(assignment.arguments, ("p1",))
+        self.assertEqual(assignment.value, 16.0)
+        self.assertTrue(assignment.negated)
 
     def test_existing_goal_is_not_replaced(self):
         _problem, parser_input = self.parse_text(
@@ -96,6 +115,53 @@ class ProblemExtensionParserTests(unittest.TestCase):
                 )
                 """
             )
+
+
+class NegatedUtilityTranslationTests(unittest.TestCase):
+    def make_task(self, assignments):
+        variable = SimpleNamespace(
+            index=0,
+            fncIndex="is-target",
+            params=(0,),
+            isNumeric=False,
+            initialValues=(SimpleNamespace(value=sas.BOOL_TRUE),),
+        )
+        task = SimpleNamespace(variables=[variable], actions=[], goals=[])
+        grounder = SimpleNamespace(
+            objects=[SimpleNamespace(name="p1")],
+            problem=SimpleNamespace(bound=2, init=[]),
+        )
+        return sas.translate(task, grounder, assignments)
+
+    def test_negated_utility_maps_to_boolean_false_value(self):
+        assignment = pddl_utility_parser.UtilityAssignment(
+            "is-target",
+            ("p1",),
+            16.0,
+            negated=True,
+        )
+
+        task = self.make_task([assignment])
+
+        self.assertEqual(task.variables[0].values, [sas.SAS_FALSE, sas.SAS_TRUE])
+        self.assertEqual(task.utility_by_sas_value, {(0, 0): 16.0})
+        self.assertEqual(task.utility_of_sas_state((1,)), 0.0)
+        self.assertEqual(task.utility_of_sas_state((0,)), 16.0)
+
+    def test_positive_and_negative_utilities_can_share_an_atom(self):
+        assignments = [
+            pddl_utility_parser.UtilityAssignment("is-target", ("p1",), 3.0),
+            pddl_utility_parser.UtilityAssignment(
+                "is-target",
+                ("p1",),
+                16.0,
+                negated=True,
+            ),
+        ]
+
+        task = self.make_task(assignments)
+
+        self.assertEqual(task.utility_by_sas_value, {(0, 1): 3.0, (0, 0): 16.0})
 
 
 class CostBoundConsumerTests(unittest.TestCase):

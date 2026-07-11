@@ -10,6 +10,7 @@ class UtilityAssignment:
     predicate: str
     arguments: tuple
     value: float
+    negated: bool = False
 
 
 # Parses a PDDL problem while preserving custom utility and bound sections.
@@ -125,6 +126,12 @@ def _parse_utility_assignment(tokens, pos):
     pos = _expect(tokens, pos, "=")
     pos = _expect(tokens, pos, "(")
 
+    negated = False
+    if pos < len(tokens) and tokens[pos].lower() == "not":
+        negated = True
+        pos += 1
+        pos = _expect(tokens, pos, "(")
+
     if pos >= len(tokens) or tokens[pos] in {"(", ")"}:
         raise ValueError("Expected predicate name in :utility assignment.")
 
@@ -138,6 +145,8 @@ def _parse_utility_assignment(tokens, pos):
         pos += 1
 
     pos = _expect(tokens, pos, ")")
+    if negated:
+        pos = _expect(tokens, pos, ")")
 
     if pos >= len(tokens):
         raise ValueError("Expected numeric utility value.")
@@ -148,7 +157,7 @@ def _parse_utility_assignment(tokens, pos):
     pos += 1
 
     pos = _expect(tokens, pos, ")")
-    return UtilityAssignment(predicate, tuple(arguments), value), pos
+    return UtilityAssignment(predicate, tuple(arguments), value, negated), pos
 
 
 # Parses a custom integer total-cost bound.

@@ -413,6 +413,20 @@ class _SASTranslator:
             if len(self.reachable_literals) == before and not self.mutex_changes:
                 break
 
+        # A negated utility needs the explicit false value of its atom.  Keeping
+        # that atom out of a multivalued mutex group makes the negation a single,
+        # exact SAS variable-value pair, just like a negative precondition.
+        for assignment in self.utility_assignments:
+            if not getattr(assignment, "negated", False):
+                continue
+            literal = _find_literal_from_utility_assignment(
+                self.task,
+                self.grounder,
+                assignment,
+            )
+            if literal is not None:
+                self.negated_precondition_literals.add(literal)
+
     # Checks action for mutex.
     def _check_action_for_mutex(self, action):
         preconditions = []
@@ -677,6 +691,15 @@ class _SASTranslator:
             sas_key = sas_task.literal_to_sas.get(literal)
             if sas_key is None:
                 raise ValueError(f"Utility literal was not translated: {assignment}")
+            if getattr(assignment, "negated", False):
+                sas_var, sas_value = sas_key
+                values = sas_task.variables[sas_var].values
+                if values != [SAS_FALSE, SAS_TRUE] or sas_value != 1:
+                    raise ValueError(
+                        "Negated utility literal was not translated as a "
+                        f"boolean SAS variable: {assignment}"
+                    )
+                sas_key = (sas_var, 0)
             sas_task.utility_by_sas_value[sas_key] = float(assignment.value)
 
     # Computes initial states.
@@ -817,10 +840,10 @@ def _utility_assignment_true_in_initial(grounder, assignment):
     problem = getattr(grounder, "problem", None)
     init = getattr(problem, "init", ()) if problem is not None else ()
 
-    for fact in init:
-        if _fact_key(fact) == wanted:
-            return True
-    return False
+    positive_is_true = any(_fact_key(fact) == wanted for fact in init)
+    if getattr(assignment, "negated", False):
+        return not positive_is_true
+    return positive_is_true
 
 
 # Handles the internal fact key step.
