@@ -323,6 +323,43 @@ class CostBoundConsumerTests(unittest.TestCase):
         self.assertEqual(value["h_loss"], 10.0)
         self.assertEqual(value["h_cmax"], 2.0)
 
+    def test_canonical_soft_goal_closure_is_one_search_macro(self):
+        task = sas.SASTask(
+            variables=[
+                sas.SASVariable(0, "u0", ["off", "on"], 1),
+                sas.SASVariable(1, "u1", ["off", "on"], 0),
+            ],
+            utility_by_sas_value={(0, 1): 5.0, (1, 1): 7.0},
+        )
+        sas.compile_soft_goals(task)
+        state = task.state_key(task.initial_state, task.numeric_initial_state)
+        policy = sas_search.BasicPolicy.make_initial(state)
+        sas_search._prepare_policy_for_queue(task, policy)
+        groups = sas_search._cached_applicable_action_groups(task, state)
+        closure_group = next(
+            (group_key, actions)
+            for group_key, actions in groups
+            if all(action.is_fictitious for action in actions)
+        )
+
+        child = sas_search._extend_policy(
+            task,
+            policy,
+            state,
+            closure_group[0],
+            closure_group[1],
+        )
+
+        self.assertIsNotNone(child)
+        self.assertEqual(child.pending, set())
+        self.assertEqual(len(child.strategy), 2)
+        self.assertTrue(
+            all(
+                all(action.is_fictitious for action, _successor in outcomes)
+                for _group, outcomes in child.strategy.values()
+            )
+        )
+
     def test_logical_state_key_ignores_only_pure_total_cost(self):
         task = sas.SASTask(
             numeric_variables=[

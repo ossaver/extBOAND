@@ -115,6 +115,15 @@ class BiObjectiveHelperTests(unittest.TestCase):
             )
         )
 
+        equal_bound = values(186.0, 0.0, tie1=186.0)
+        self.assertFalse(
+            sas_search._bound_dominated_by_incumbent(
+                equal_bound,
+                [incumbent],
+                ORDER[:2],
+            )
+        )
+
     def test_bootstrap_can_remain_internal_and_uncertified(self):
         bootstrap = sas_search.SearchSolution(
             policy=object(),
