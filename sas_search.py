@@ -352,7 +352,7 @@ def boand_star_policy_search(
                 if _violates_total_cost_bound(sas_task, values):
                     continue
                 if any(
-                    _solution_values_dominate(
+                    _solution_values_strictly_dominate(
                         incumbent.values,
                         values,
                         objective_order,
@@ -814,10 +814,17 @@ def _bootstrap_feasible_solution(
 # Checks whether a feasible incumbent weakly dominates an optimistic bound.
 def _bound_dominated_by_incumbent(bound, incumbents, objective_order):
     return any(
-        all(
-            _criterion_min_value(incumbent.values, criterion)
-            <= _safe_dominance_bound_value(bound, criterion) + EPS
-            for criterion in objective_order
+        (
+            all(
+                _criterion_min_value(incumbent.values, criterion)
+                <= _safe_dominance_bound_value(bound, criterion) + EPS
+                for criterion in objective_order
+            )
+            and any(
+                _criterion_min_value(incumbent.values, criterion)
+                < _safe_dominance_bound_value(bound, criterion) - EPS
+                for criterion in objective_order
+            )
         )
         for incumbent in incumbents
     )
@@ -864,6 +871,18 @@ def _solution_values_dominate(left, right, objective_order):
         _criterion_min_value(left, criterion)
         <= _criterion_min_value(right, criterion) + EPS
         for criterion in objective_order
+    )
+
+
+# Checks strict Pareto dominance between two complete objective vectors.
+def _solution_values_strictly_dominate(left, right, objective_order):
+    return (
+        _solution_values_dominate(left, right, objective_order)
+        and any(
+            _criterion_min_value(left, criterion)
+            < _criterion_min_value(right, criterion) - EPS
+            for criterion in objective_order
+        )
     )
 
 
@@ -1266,15 +1285,38 @@ def _canonical_closure_action_allowed(sas_task, sas_state, action):
 # Handles the internal extend policy step.
 def _extend_policy(sas_task, policy, state_key, group_key, actions):
     child = policy.copy()
+    successors = _apply_policy_decision(
+        sas_task,
+        child,
+        state_key,
+        group_key,
+        actions,
+    )
+    if successors is None:
+        return None
+
+    if actions and all(action.is_fictitious for action in actions):
+        if len(successors) != 1:
+            raise ValueError("A canonical soft-goal closure must be deterministic")
+        if not _finish_canonical_closure(sas_task, child, successors[0]):
+            return None
+
+    return child
+
+
+# Adds one state-action assignment to a policy without copying it.
+def _apply_policy_decision(sas_task, child, state_key, group_key, actions):
     child.pending.remove(state_key)
     current_metrics = child.state_metrics[state_key]
 
     outcomes = []
+    successors = []
     for action in actions:
         successor = _cached_successor(sas_task, state_key, action)
         if not _numeric_goal_bounds_hold(sas_task, successor):
             return None
         outcomes.append((action, successor))
+        successors.append(successor)
         successor_metrics = _successor_metrics(
             sas_task,
             current_metrics,
@@ -1289,7 +1331,40 @@ def _extend_policy(sas_task, policy, state_key, group_key, actions):
             child.pending.add(successor)
 
     child.strategy[state_key] = (group_key, tuple(outcomes))
-    return child
+    return successors
+
+
+# Completes the zero-cost canonical closure chain as one search macro.
+def _finish_canonical_closure(sas_task, policy, state_key):
+    current = state_key
+    while current in policy.pending:
+        if sas_task.is_goal_state(*current):
+            policy.pending.remove(current)
+            policy.terminal_goals.add(current)
+            return True
+
+        groups = _cached_applicable_action_groups(sas_task, current)
+        closure_groups = [
+            (group_key, actions)
+            for group_key, actions in groups
+            if actions and all(action.is_fictitious for action in actions)
+        ]
+        if len(closure_groups) != 1:
+            return False
+
+        group_key, actions = closure_groups[0]
+        successors = _apply_policy_decision(
+            sas_task,
+            policy,
+            current,
+            group_key,
+            actions,
+        )
+        if successors is None or len(successors) != 1:
+            return False
+        current = successors[0]
+
+    return sas_task.is_goal_state(*current) or current in policy.strategy
 
 
 # Handles the internal action group key step.
