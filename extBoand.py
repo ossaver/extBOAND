@@ -360,17 +360,18 @@ def parse_args():
     parser.add_argument(
         "--andor-depth",
         type=int,
-        default=2,
+        default=None,
         help=(
             "Depth limit for the relaxed AND-OR guaranteed-utility heuristic. "
-            "The default is 2; at the limit it falls back to the admissible "
-            "relaxed utility upper bound."
+            "If omitted, a relaxed-layer estimator selects a value up to 4. "
+            "At the limit the heuristic falls back to the admissible relaxed "
+            "utility upper bound."
         ),
     )
     parser.add_argument(
         "--report-every",
         type=int,
-        default=10000,
+        default=1000,
         help="Print BOAND* progress every N popped policies. Use 0 to disable.",
     )
     parser.add_argument(
@@ -384,7 +385,6 @@ def parse_args():
 # Runs the full planner pipeline from parsing to optional search and output.
 def main():
     args = parse_args()
-    sas_heuristics.DEFAULT_ANDOR_DEPTH = args.andor_depth
     domain_file = str(Path(args.domain_file))
     problem_file = str(Path(args.problem_file))
     run_search = not args.no_search
@@ -395,6 +395,18 @@ def main():
         problem_file,
         compile_soft_goals=args.compile_soft_goals or run_search,
     )
+    sas_task.cost_bound_criterion = sas_search._cost_bound_criterion(
+        args.optimization_order
+    )
+    depth_estimate = None
+    if args.andor_depth is None:
+        depth_estimate = sas_heuristics.estimate_andor_depth(
+            sas_task,
+            max_depth=4,
+        )
+        sas_heuristics.DEFAULT_ANDOR_DEPTH = depth_estimate["depth"]
+    else:
+        sas_heuristics.DEFAULT_ANDOR_DEPTH = args.andor_depth
 
     print_summary(
         domain,
@@ -405,6 +417,18 @@ def main():
     )
     print("")
     print_utilities(sas_task)
+
+    if depth_estimate is not None:
+        print("")
+        print(
+            "Automatic AND/OR depth: "
+            f"{depth_estimate['depth']} "
+            f"(relaxed layers={depth_estimate['relaxed_layers']:.0f}, "
+            f"target utility={depth_estimate['target_utility']:.1f}, "
+            "relevant nondeterministic groups="
+            f"{depth_estimate['relevant_nondeterministic_groups']}/"
+            f"{depth_estimate['nondeterministic_groups']}, max=4)"
+        )
 
     if args.variables:
         print("")

@@ -208,5 +208,5 @@
     (= (goldcount-3) 43)
 )
 
-(:bound 5)
+(:bound 9)
 )

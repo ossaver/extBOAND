@@ -237,6 +237,239 @@ class CostBoundConsumerTests(unittest.TestCase):
             6.0,
         )
 
+    def test_relaxed_utility_upper_bound_includes_constant_utility(self):
+        task = sas.SASTask(
+            variables=[
+                sas.SASVariable(0, "goldcount", ["not-three", "three"], 1),
+            ],
+            utility_by_sas_value={(0, 1): 19.0},
+            constant_utility=17.0,
+            max_utility=36.0,
+        )
+        state = ((1,), ())
+
+        upper_bound = sas_heuristics.relaxed_utility_upper_bound(task, state)
+
+        self.assertEqual(upper_bound, 36.0)
+
+    def test_relaxed_cost_for_utility_builds_hmax_utility_envelope(self):
+        task = sas.SASTask(
+            variables=[
+                sas.SASVariable(0, "u1", ["off", "on"], 0),
+                sas.SASVariable(1, "u2", ["off", "on"], 0),
+            ],
+            utility_by_sas_value={(0, 1): 5.0, (1, 1): 7.0},
+            constant_utility=3.0,
+            max_utility=15.0,
+        )
+        state = ((0, 0), ())
+        value_costs = {
+            (0, 0): 0.0,
+            (0, 1): 2.0,
+            (1, 0): 0.0,
+            (1, 1): 4.0,
+        }
+
+        self.assertEqual(
+            sas_heuristics.relaxed_cost_for_utility(
+                task, state, 3.0, value_costs=value_costs
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            sas_heuristics.relaxed_cost_for_utility(
+                task, state, 8.0, value_costs=value_costs
+            ),
+            2.0,
+        )
+        self.assertEqual(
+            sas_heuristics.relaxed_cost_for_utility(
+                task, state, 15.0, value_costs=value_costs
+            ),
+            4.0,
+        )
+        self.assertEqual(
+            sas_heuristics.relaxed_cost_for_utility(
+                task,
+                state,
+                15.0,
+                remaining_budget=3.0,
+                value_costs=value_costs,
+            ),
+            float("inf"),
+        )
+
+    def test_relaxed_action_data_is_precomputed_once_for_multiple_states(self):
+        task = sas.SASTask(
+            variables=[
+                sas.SASVariable(0, "v0", ["off", "on"], 0),
+                sas.SASVariable(1, "v1", ["off", "on"], 0),
+            ],
+            actions=[
+                sas.SASTranslatedAction(
+                    0,
+                    "enable-v0",
+                    conditions=(sas.SASCondition(0, 0),),
+                    effects=(sas.SASCondition(0, 1),),
+                ),
+                sas.SASTranslatedAction(
+                    1,
+                    "enable-v1",
+                    conditions=(sas.SASCondition(0, 1),),
+                    effects=(sas.SASCondition(1, 1),),
+                ),
+            ],
+        )
+
+        with patch.object(
+            sas_heuristics,
+            "_constant_budget_cost",
+            return_value=1.0,
+        ) as cost:
+            first = sas_heuristics.relaxed_value_costs(task, ((0, 0), ()))
+            second = sas_heuristics.relaxed_value_costs(task, ((1, 0), ()))
+
+        self.assertEqual(first[(1, 1)], 2.0)
+        self.assertEqual(second[(1, 1)], 1.0)
+        self.assertEqual(cost.call_count, 2)
+
+    def test_relaxed_state_summary_is_shared_by_all_relaxed_queries(self):
+        task = sas.SASTask(
+            variables=[
+                sas.SASVariable(0, "v0", ["off", "on"], 0),
+                sas.SASVariable(1, "v1", ["off", "on"], 0),
+            ],
+            actions=[
+                sas.SASTranslatedAction(
+                    0,
+                    "enable-v0",
+                    conditions=(sas.SASCondition(0, 0),),
+                    effects=(sas.SASCondition(0, 1),),
+                ),
+                sas.SASTranslatedAction(
+                    1,
+                    "enable-v1",
+                    conditions=(sas.SASCondition(0, 1),),
+                    effects=(sas.SASCondition(1, 1),),
+                ),
+            ],
+            goals=[
+                sas.SASTranslatedAction(
+                    0,
+                    "goal",
+                    conditions=(sas.SASCondition(1, 1),),
+                    is_goal=True,
+                ),
+            ],
+            utility_by_sas_value={(0, 1): 5.0, (1, 1): 7.0},
+            constant_utility=3.0,
+            max_utility=15.0,
+        )
+        state = ((0, 0), ())
+        compute = sas_heuristics._compute_relaxed_value_costs
+
+        with (
+            patch.object(
+                sas_heuristics,
+                "_constant_budget_cost",
+                return_value=1.0,
+            ),
+            patch.object(
+                sas_heuristics,
+                "_compute_relaxed_value_costs",
+                wraps=compute,
+            ) as relaxed_compute,
+        ):
+            value_costs = sas_heuristics.relaxed_value_costs(task, state)
+            goal_cost = sas_heuristics.relaxed_goal_distance(task, state)
+            utility_at_one = sas_heuristics.relaxed_utility_upper_bound(
+                task,
+                state,
+                remaining_budget=1.0,
+            )
+            utility_at_two = sas_heuristics.relaxed_utility_upper_bound(
+                task,
+                state,
+                remaining_budget=2.0,
+            )
+            utility_cost = sas_heuristics.relaxed_cost_for_utility(
+                task,
+                state,
+                target_utility=15.0,
+                remaining_budget=2.0,
+            )
+
+        self.assertEqual(value_costs[(1, 1)], 2.0)
+        self.assertEqual(goal_cost, 2.0)
+        self.assertEqual(utility_at_one, 8.0)
+        self.assertEqual(utility_at_two, 15.0)
+        self.assertEqual(utility_cost, 2.0)
+        self.assertEqual(relaxed_compute.call_count, 1)
+
+    def test_static_andor_depth_uses_relaxed_utility_layers(self):
+        actions = []
+        for layer in range(3):
+            conditions = (sas.SASCondition(0, layer),)
+            actions.extend(
+                (
+                    sas.SASTranslatedAction(
+                        len(actions),
+                        f"step-{layer}_DETDUP_1",
+                        conditions=conditions,
+                        effects=(sas.SASCondition(0, layer + 1),),
+                    ),
+                    sas.SASTranslatedAction(
+                        len(actions) + 1,
+                        f"step-{layer}_DETDUP_2",
+                        conditions=conditions,
+                    ),
+                )
+            )
+        task = sas.SASTask(
+            variables=[
+                sas.SASVariable(
+                    0,
+                    "progress",
+                    ["zero", "one", "two", "three"],
+                    0,
+                ),
+            ],
+            actions=actions,
+            initial_state=(0,),
+            numeric_initial_state=(),
+            utility_by_sas_value={(0, 3): 9.0},
+            max_utility=9.0,
+        )
+
+        estimate = sas_heuristics.estimate_andor_depth(task, max_depth=4)
+
+        self.assertEqual(estimate["relaxed_layers"], 3.0)
+        self.assertEqual(estimate["depth"], 4)
+        self.assertEqual(estimate["nondeterministic_groups"], 3)
+        self.assertEqual(estimate["relevant_nondeterministic_groups"], 3)
+
+    def test_static_andor_depth_is_one_for_deterministic_task(self):
+        task = sas.SASTask(
+            variables=[sas.SASVariable(0, "goal", ["off", "on"], 0)],
+            actions=[
+                sas.SASTranslatedAction(
+                    0,
+                    "enable",
+                    conditions=(sas.SASCondition(0, 0),),
+                    effects=(sas.SASCondition(0, 1),),
+                ),
+            ],
+            initial_state=(0,),
+            numeric_initial_state=(),
+            utility_by_sas_value={(0, 1): 1.0},
+            max_utility=1.0,
+        )
+
+        estimate = sas_heuristics.estimate_andor_depth(task, max_depth=4)
+
+        self.assertEqual(estimate["depth"], 1)
+        self.assertEqual(estimate["relevant_nondeterministic_groups"], 0)
+
     def test_cmin_heuristics_do_not_restrict_expensive_branches(self):
         task = SimpleNamespace(
             cost_bound=10,
@@ -324,8 +557,8 @@ class CostBoundConsumerTests(unittest.TestCase):
             ),
             patch.object(
                 sas_heuristics,
-                "relaxed_utility_upper_bound",
-                return_value=100.0,
+                "relaxed_cost_for_utility",
+                return_value=5.0,
             ),
         ):
             value = sas_heuristics._compute_andor_goal_cost_with_utility_target(
@@ -337,9 +570,9 @@ class CostBoundConsumerTests(unittest.TestCase):
                 fallback_cost=3.0,
             )
 
-        self.assertEqual(value, 3.0)
+        self.assertEqual(value, 5.0)
 
-    def test_cmax_bound_does_not_condition_on_optimistic_utility(self):
+    def test_cmax_pairs_with_utility_but_budget_cost_stays_unconditional(self):
         task = SimpleNamespace(
             max_utility=100.0,
         )
@@ -374,9 +607,7 @@ class CostBoundConsumerTests(unittest.TestCase):
             patch.object(
                 sas_heuristics,
                 "andor_goal_cost_with_utility_target",
-                side_effect=AssertionError(
-                    "conditional utility cost must not enter the Cmax bound"
-                ),
+                return_value=4.0,
             ),
             patch.object(
                 sas_heuristics,
@@ -387,7 +618,33 @@ class CostBoundConsumerTests(unittest.TestCase):
             value = sas_heuristics.evaluate_state(task, state)
 
         self.assertEqual(value["h_loss"], 10.0)
-        self.assertEqual(value["h_cmax"], 2.0)
+        self.assertEqual(value["h_cmax"], 4.0)
+        self.assertEqual(value["h_cmax_unconditional"], 2.0)
+        self.assertEqual(value["h_utility_cost"], 4.0)
+
+    def test_policy_bound_keeps_conditional_and_budget_costs_separate(self):
+        task = sas.SASTask(max_utility=36.0)
+        state = task.state_key((), ())
+        policy = sas_search.BasicPolicy.make_initial(state)
+        heuristic = {
+            "h_loss": 0.0,
+            "h_loss_min": 0.0,
+            "h_cmax": 9.0,
+            "h_cmax_unconditional": 0.0,
+            "h_cmin": 0.0,
+            "h_goal": 9.0,
+        }
+
+        with patch.object(
+            sas_search,
+            "_heuristic_value",
+            return_value=heuristic,
+        ):
+            bound = sas_search.evaluate_policy_lower_bound(task, policy)
+
+        self.assertEqual(bound["Umin"], 36.0)
+        self.assertEqual(bound["Cmax"], 9.0)
+        self.assertEqual(bound["Cmax_budget"], 0.0)
 
     def test_canonical_soft_goal_closure_is_one_search_macro(self):
         task = sas.SASTask(

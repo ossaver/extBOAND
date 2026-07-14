@@ -232,7 +232,7 @@ def boand_star_policy_search(
     optimization_order=("Umin", "Cmax", "Umax", "Cmin"),
     use_heuristics=True,
     max_solutions=None,
-    report_every=10000,
+    report_every=1000,
     on_solution=None,
 ):
     objective_order = tuple(optimization_order[:2])

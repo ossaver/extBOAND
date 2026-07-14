@@ -216,5 +216,5 @@
     (= (goldcount-3) 11)
 )
 
-(:bound 4)
+(:bound 10)
 )

@@ -1,3 +1,4 @@
+from dataclasses import dataclass, field
 import math
 import re
 
@@ -10,9 +11,17 @@ EPS = 1e-9
 IN_PROGRESS = object()
 
 
+@dataclass
+class RelaxedStateSummary:
+    value_costs: dict
+    goal_distance: float = None
+    utility_loss: float = None
+    utility_upper_by_budget: dict = field(default_factory=dict)
+    utility_cost_by_target: dict = field(default_factory=dict)
+
+
 # Computes all heuristic estimates used for a SAS state.
 def evaluate_state(sas_task, state_key):
-    value_costs = relaxed_value_costs(sas_task, state_key)
     remaining_budget = _remaining_budget(sas_task, state_key)
     guaranteed_utility = andor_guaranteed_utility(
         sas_task,
@@ -20,7 +29,7 @@ def evaluate_state(sas_task, state_key):
         remaining_budget=remaining_budget,
         depth=DEFAULT_ANDOR_DEPTH,
     )
-    relaxed_goal = relaxed_goal_distance(sas_task, state_key, value_costs)
+    relaxed_goal = relaxed_goal_distance(sas_task, state_key)
     guaranteed_cost = andor_guaranteed_goal_cost(
         sas_task,
         state_key,
@@ -28,13 +37,95 @@ def evaluate_state(sas_task, state_key):
         depth=DEFAULT_ANDOR_DEPTH,
         fallback_cost=relaxed_goal,
     )
+    utility_cost = andor_goal_cost_with_utility_target(
+        sas_task,
+        state_key,
+        target_utility=guaranteed_utility,
+        remaining_budget=remaining_budget,
+        depth=DEFAULT_ANDOR_DEPTH,
+        fallback_cost=relaxed_goal,
+    )
     return {
         "h_loss": max(0.0, sas_task.max_utility - guaranteed_utility),
-        "h_loss_min": relaxed_utility_loss(sas_task, state_key, value_costs),
-        "h_cmax": guaranteed_cost,
+        "h_loss_min": relaxed_utility_loss(sas_task, state_key),
+        # Cmax is paired with the optimistic guaranteed-utility estimate.  A
+        # policy may still stop at lower utility for less cost, so retain the
+        # unconditional cost separately for resource-bound pruning.
+        "h_cmax": utility_cost,
         "h_cmax_unconditional": guaranteed_cost,
         "h_cmin": relaxed_goal,
-        "h_goal": guaranteed_cost,
+        "h_goal": utility_cost,
+        # This cost is conditional on attaining guaranteed_utility.  It is
+        # useful for search ordering, but is not an unconditional Cmax bound:
+        # an oversubscription policy may stop earlier with less utility.
+        "h_utility_cost": utility_cost,
+    }
+
+
+# Estimates a useful finite AND-OR depth from relaxed causal layers.
+def estimate_andor_depth(sas_task, max_depth=4):
+    if max_depth < 1:
+        raise ValueError("max_depth must be at least 1")
+
+    state_key = sas_task.state_key(
+        sas_task.initial_state,
+        sas_task.numeric_initial_state,
+    )
+    relevant_vars = _backward_relevant_variables(sas_task)
+    nondeterministic_groups = _nondeterministic_action_groups(sas_task)
+    relevant_groups = tuple(
+        actions
+        for actions in nondeterministic_groups
+        if any(
+            effect.var in relevant_vars
+            for action in actions
+            for effect in action.effects
+        )
+    )
+
+    target_utility = relaxed_utility_upper_bound(
+        sas_task,
+        state_key,
+        remaining_budget=_remaining_budget(sas_task, state_key),
+    )
+    if not relevant_groups:
+        return {
+            "depth": 1,
+            "relaxed_layers": 0.0,
+            "target_utility": target_utility,
+            "nondeterministic_groups": len(nondeterministic_groups),
+            "relevant_nondeterministic_groups": 0,
+        }
+
+    layer_costs = _compute_relaxed_value_costs(
+        sas_task,
+        state_key,
+        unit_action_cost=True,
+    )
+    utility_layers = relaxed_cost_for_utility(
+        sas_task,
+        state_key,
+        target_utility=target_utility,
+        value_costs=layer_costs,
+    )
+    goal_layers = relaxed_goal_distance(
+        sas_task,
+        state_key,
+        value_costs=layer_costs,
+    )
+    finite_layers = tuple(
+        value
+        for value in (utility_layers, goal_layers)
+        if math.isfinite(value)
+    )
+    relaxed_layers = max(finite_layers, default=0.0)
+    depth = min(max_depth, max(1, math.ceil(relaxed_layers) + 1))
+    return {
+        "depth": depth,
+        "relaxed_layers": relaxed_layers,
+        "target_utility": target_utility,
+        "nondeterministic_groups": len(nondeterministic_groups),
+        "relevant_nondeterministic_groups": len(relevant_groups),
     }
 
 
@@ -166,20 +257,32 @@ def relaxed_utility_upper_bound(sas_task, state_key, remaining_budget=None):
     if remaining_budget is not None and remaining_budget < -EPS:
         return -math.inf
 
-    value_costs = relaxed_value_costs(sas_task, state_key)
-    total = 0.0
+    relaxed = _relaxed_state_summary(sas_task, state_key)
+    budget_key = _budget_cache_key(remaining_budget)
+    if budget_key in relaxed.utility_upper_by_budget:
+        return relaxed.utility_upper_by_budget[budget_key]
+
+    total = sas_task.constant_utility
     for var_index in _utility_vars(sas_task):
         best_utility = 0.0
         for value_index in range(len(sas_task.variables[var_index].values)):
-            cost = value_costs.get((var_index, value_index), math.inf)
+            cost = relaxed.value_costs.get(
+                (var_index, value_index),
+                math.inf,
+            )
             if remaining_budget is not None and cost > remaining_budget + EPS:
                 continue
             if cost < math.inf:
                 best_utility = max(
                     best_utility,
-                    sas_task.utility_by_sas_value.get((var_index, value_index), 0.0),
+                    sas_task.utility_by_sas_value.get(
+                        (var_index, value_index),
+                        0.0,
+                    ),
                 )
         total += best_utility
+
+    relaxed.utility_upper_by_budget[budget_key] = total
     return total
 
 
@@ -325,6 +428,7 @@ def andor_goal_cost_with_utility_target(
         target_key,
         _budget_cache_key(remaining_budget),
         depth,
+        _budget_cache_key(fallback_cost),
     )
     cached = cache.get(key)
     if cached is IN_PROGRESS:
@@ -478,20 +582,86 @@ def _conditional_goal_cost_fallback(
     remaining_budget,
     fallback_cost,
 ):
-    relaxed_upper = relaxed_utility_upper_bound(
+    utility_cost = relaxed_cost_for_utility(
         sas_task,
         state_key,
-        remaining_budget,
+        target_utility,
+        remaining_budget=remaining_budget,
     )
-    if relaxed_upper + EPS < target_utility:
+    if utility_cost == math.inf:
         return math.inf
-    return _goal_cost_fallback(sas_task, state_key, fallback_cost)
+    goal_cost = _goal_cost_fallback(sas_task, state_key, fallback_cost)
+    return max(goal_cost, utility_cost)
+
+
+# Estimates the hmax cost required to attain at least target_utility.
+def relaxed_cost_for_utility(
+    sas_task,
+    state_key,
+    target_utility,
+    remaining_budget=None,
+    value_costs=None,
+):
+    if target_utility <= sas_task.constant_utility + EPS:
+        return 0.0
+
+    relaxed = None
+    cache_key = None
+    if value_costs is None:
+        relaxed = _relaxed_state_summary(sas_task, state_key)
+        value_costs = relaxed.value_costs
+        cache_key = (
+            round(target_utility, 9),
+            _budget_cache_key(remaining_budget),
+        )
+        if cache_key in relaxed.utility_cost_by_target:
+            return relaxed.utility_cost_by_target[cache_key]
+
+    utility_vars = _utility_vars(sas_task)
+    thresholds = {0.0}
+    for var_index in utility_vars:
+        for value_index in range(len(sas_task.variables[var_index].values)):
+            cost = value_costs.get((var_index, value_index), math.inf)
+            if math.isfinite(cost) and (
+                remaining_budget is None or cost <= remaining_budget + EPS
+            ):
+                thresholds.add(max(0.0, cost))
+
+    result = math.inf
+    for threshold in sorted(thresholds):
+        total_utility = sas_task.constant_utility
+        for var_index in utility_vars:
+            best_utility = 0.0
+            for value_index in range(len(sas_task.variables[var_index].values)):
+                cost = value_costs.get((var_index, value_index), math.inf)
+                if cost <= threshold + EPS:
+                    best_utility = max(
+                        best_utility,
+                        sas_task.utility_by_sas_value.get(
+                            (var_index, value_index),
+                            0.0,
+                        ),
+                    )
+            total_utility += best_utility
+
+        if total_utility + EPS >= target_utility:
+            result = threshold
+            break
+
+    if relaxed is not None:
+        relaxed.utility_cost_by_target[cache_key] = result
+    return result
 
 
 # Estimates the minimum utility loss under delete relaxation.
 def relaxed_utility_loss(sas_task, state_key, value_costs=None):
     if value_costs is None:
-        value_costs = relaxed_value_costs(sas_task, state_key)
+        relaxed = _relaxed_state_summary(sas_task, state_key)
+        if relaxed.utility_loss is not None:
+            return relaxed.utility_loss
+        value_costs = relaxed.value_costs
+    else:
+        relaxed = None
 
     loss = 0.0
     for var_index in _utility_vars(sas_task):
@@ -504,13 +674,29 @@ def relaxed_utility_loss(sas_task, state_key, value_costs=None):
                     sas_task.utility_by_sas_value.get((var_index, value_index), 0.0),
                 )
         loss += max_utility - best_reachable_utility
+    if relaxed is not None:
+        relaxed.utility_loss = loss
     return loss
 
 
 # Estimates relaxed cost distance to the hard goal.
 def relaxed_goal_distance(sas_task, state_key, value_costs=None):
     if value_costs is None:
-        value_costs = relaxed_value_costs(sas_task, state_key)
+        relaxed = _relaxed_state_summary(sas_task, state_key)
+        if relaxed.goal_distance is not None:
+            return relaxed.goal_distance
+        relaxed.goal_distance = _relaxed_goal_distance_from_costs(
+            sas_task,
+            state_key,
+            relaxed.value_costs,
+        )
+        return relaxed.goal_distance
+
+    return _relaxed_goal_distance_from_costs(sas_task, state_key, value_costs)
+
+
+# Computes relaxed hard-goal distance from an existing hmax value table.
+def _relaxed_goal_distance_from_costs(sas_task, state_key, value_costs):
 
     if not sas_task.goals:
         return 0.0
@@ -542,31 +728,48 @@ def relaxed_goal_distance(sas_task, state_key, value_costs=None):
 
 # Computes relaxed reachability costs for SAS variable values.
 def relaxed_value_costs(sas_task, state_key):
-    cache = getattr(sas_task, "_relaxed_value_cost_cache", None)
+    return _relaxed_state_summary(sas_task, state_key).value_costs
+
+
+# Returns all relaxed information shared by the state heuristics.
+def _relaxed_state_summary(sas_task, state_key):
+    cache = getattr(sas_task, "_relaxed_state_summary_cache", None)
     if cache is None:
         cache = {}
-        setattr(sas_task, "_relaxed_value_cost_cache", cache)
-    cache_key = _logical_state_key(sas_task, state_key)
+        setattr(sas_task, "_relaxed_state_summary_cache", cache)
+    cache_key = (len(sas_task.actions), _logical_state_key(sas_task, state_key))
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
+
+    summary = RelaxedStateSummary(
+        value_costs=_compute_relaxed_value_costs(sas_task, state_key),
+    )
+    cache[cache_key] = summary
+    return summary
+
+
+# Computes relaxed reachability costs without consulting the state summary.
+def _compute_relaxed_value_costs(
+    sas_task,
+    state_key,
+    unit_action_cost=False,
+):
 
     sas_state, _numeric_state = state_key
     value_costs = {}
     for var_index, value_index in enumerate(sas_state):
         value_costs[(var_index, value_index)] = 0.0
 
+    relaxed_actions = _relaxed_action_data(sas_task)
     changed = True
     while changed:
         changed = False
-        for action in sas_task.actions:
-            if action.is_fictitious:
-                continue
-
+        for conditions, effects, action_cost in relaxed_actions:
             pre_cost = 0.0
             reachable = True
-            for condition in action.conditions:
-                cost = value_costs.get((condition.var, condition.value), math.inf)
+            for condition in conditions:
+                cost = value_costs.get(condition, math.inf)
                 if cost == math.inf:
                     reachable = False
                     break
@@ -575,19 +778,88 @@ def relaxed_value_costs(sas_task, state_key):
             if not reachable:
                 continue
 
-            action_cost = _constant_budget_cost(sas_task, action)
-            if action_cost is None:
-                action_cost = 0.0
-            next_cost = pre_cost + action_cost
+            next_cost = pre_cost + (1.0 if unit_action_cost else action_cost)
 
-            for effect in action.effects:
-                key = (effect.var, effect.value)
+            for key in effects:
                 if next_cost < value_costs.get(key, math.inf):
                     value_costs[key] = next_cost
                     changed = True
 
-    cache[cache_key] = value_costs
     return value_costs
+
+
+# Computes the SAS-variable closure that can influence goals or utilities.
+def _backward_relevant_variables(sas_task):
+    closure_vars = set(getattr(sas_task, "soft_goal_closure_vars", ()))
+    relevant = set(_utility_vars(sas_task))
+    for goal in sas_task.goals:
+        relevant.update(
+            condition.var
+            for condition in goal.conditions
+            if condition.var not in closure_vars
+        )
+
+    changed = True
+    while changed:
+        changed = False
+        for action in sas_task.actions:
+            if action.is_fictitious:
+                continue
+            if not any(effect.var in relevant for effect in action.effects):
+                continue
+            old_size = len(relevant)
+            relevant.update(condition.var for condition in action.conditions)
+            if len(relevant) != old_size:
+                changed = True
+    return relevant
+
+
+# Returns grounded action groups with more than one possible outcome.
+def _nondeterministic_action_groups(sas_task):
+    groups = {}
+    for action in sas_task.actions:
+        if action.is_fictitious:
+            continue
+        group_key = _action_group_key(action)
+        groups.setdefault(group_key, []).append(action)
+    return tuple(
+        tuple(actions)
+        for actions in groups.values()
+        if len(actions) > 1
+    )
+
+
+# Precomputes the immutable action data used by every relaxed hmax evaluation.
+def _relaxed_action_data(sas_task):
+    action_count = len(sas_task.actions)
+    cached = getattr(sas_task, "_relaxed_action_data_cache", None)
+    cached_count = getattr(sas_task, "_relaxed_action_data_action_count", None)
+    if cached is not None and cached_count == action_count:
+        return cached
+
+    relaxed_actions = []
+    for action in sas_task.actions:
+        if action.is_fictitious:
+            continue
+
+        action_cost = _constant_budget_cost(sas_task, action)
+        if action_cost is None:
+            action_cost = 0.0
+        relaxed_actions.append(
+            (
+                tuple(
+                    (condition.var, condition.value)
+                    for condition in action.conditions
+                ),
+                tuple((effect.var, effect.value) for effect in action.effects),
+                action_cost,
+            )
+        )
+
+    cached = tuple(relaxed_actions)
+    setattr(sas_task, "_relaxed_action_data_cache", cached)
+    setattr(sas_task, "_relaxed_action_data_action_count", action_count)
+    return cached
 
 
 # Handles the internal utility vars step.

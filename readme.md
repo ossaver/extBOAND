@@ -50,7 +50,7 @@ Available parameters:
 - `--search-algorithm`: selects the search algorithm. It accepts `boand`, `dfs`, and `bfs`. The normal value is `boand`.
 - `-n`, `--num-solutions`: stops after the requested number of bi-objective Pareto solutions. The resulting coverage set may be incomplete.
 - `--no-heuristics`: disables the relaxed and AND-OR heuristics used to guide the search.
-- `--andor-depth`: sets a maximum depth for the AND-OR heuristic. If not specified, the depth is unbounded and relaxations are used as a fallback in cycles.
+- `--andor-depth`: sets the depth of the AND-OR heuristic explicitly. If omitted, ExtBoand estimates it from the relaxed action layers needed to reach the utility/goal target, adds one outcome layer, and caps the result at 4.
 - `--report-every`: controls how often progress is printed, measured in policies extracted from the open list. With `0`, these periodic messages are disabled.
 - `--full`: prints the complete SAS representation.
 
@@ -251,6 +251,30 @@ Several estimates are combined:
 - Guaranteed cost to the goal.
 - Cost conditioned on maintaining a utility target.
 - Relaxed distance to the goal.
+
+### Why the heuristics differ by metric
+
+The four reported metrics do not have the same semantics under action
+nondeterminism, so they should not all use the same relaxation.
+
+- `Umin` and `Cmax` are **worst-case** metrics. `Umin` is the utility that
+  every outcome of the policy guarantees, while `Cmax` is the largest cost
+  that any outcome can incur. Their estimates therefore use relaxed AND-OR
+  exploration: selecting an action is an OR choice, but every possible
+  outcome of that action is an AND obligation that the policy must handle.
+  This preserves the adversarial, guarantee-oriented meaning of both
+  metrics.
+- `Umax` and `Cmin` are **best-case** metrics. `Umax` only requires that one
+  branch can reach a given utility, and `Cmin` only requires that one branch
+  can reach the goal at a given cost. They consequently use the ordinary
+  relaxed graph, which computes an optimistic existential estimate: it is
+  enough for a favourable relaxed continuation to exist.
+
+Using ordinary relaxed reachability for `Umin` or `Cmax` would ignore adverse
+outcomes and could overstate guaranteed utility or understate worst-case cost.
+Conversely, using AND-OR reasoning for `Umax` or `Cmin` would impose a
+guarantee that those metrics do not require, making their estimates needlessly
+conservative and more expensive to compute.
 
 The evaluation of a state returns, among others:
 
