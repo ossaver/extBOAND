@@ -289,10 +289,16 @@ def boand_star_policy_search(
     else:
         print(f"Max expansions: {max_expansions}", flush=True)
     andor_depth = getattr(sas_heuristics, "DEFAULT_ANDOR_DEPTH", None)
-    if andor_depth is None:
-        print("AND/OR Umin depth: unbounded", flush=True)
+    if not use_heuristics:
+        print("Heuristics: blind", flush=True)
+    elif andor_depth == 0:
+        print("Heuristics: hmax", flush=True)
     else:
-        print(f"AND/OR Umin depth: {andor_depth}", flush=True)
+        print("Heuristics: and/or", flush=True)
+        if andor_depth is None:
+            print("AND/OR Umin depth: unbounded", flush=True)
+        else:
+            print(f"AND/OR Umin depth: {andor_depth}", flush=True)
 
     _prepare_policy_for_queue(sas_task, initial_policy)
     initial_f = evaluate_policy_lower_bound(

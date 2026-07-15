@@ -49,8 +49,8 @@ Available parameters:
 - `--max-expansions`: limits the number of policy expansions. If not specified, the search has no limit and continues until the open list is exhausted or the process is stopped externally.
 - `--search-algorithm`: selects the search algorithm. It accepts `boand`, `dfs`, and `bfs`. The normal value is `boand`.
 - `-n`, `--num-solutions`: stops after the requested number of bi-objective Pareto solutions. The resulting coverage set may be incomplete.
-- `--no-heuristics`: disables the relaxed and AND-OR heuristics used to guide the search.
-- `--andor-depth`: sets the depth of the AND-OR heuristic explicitly. If omitted, ExtBoand estimates it from the relaxed action layers needed to reach the utility/goal target, adds one outcome layer, and caps the result at 4.
+- `--heuristics`: selects `and/or` (default), `hmax`, or `blind`. `and/or` uses relaxed AND-OR estimates for `Umin` and `Cmax`, and Hmax for `Umax` and `Cmin`; `hmax` uses Hmax for all four metrics; `blind` uses zero heuristic estimates without changing the selected search algorithm.
+- `--andor-depth`: sets the depth of the AND-OR heuristic explicitly. It is only valid with `--heuristics and/or`. If omitted, ExtBoand estimates it from the relaxed action layers needed to reach the utility/goal target, adds one outcome layer, and caps the result at 4.
 - `--report-every`: controls how often progress is printed, measured in policies extracted from the open list. With `0`, these periodic messages are disabled.
 - `--full`: prints the complete SAS representation.
 
@@ -251,6 +251,16 @@ Several estimates are combined:
 - Guaranteed cost to the goal.
 - Cost conditioned on maintaining a utility target.
 - Relaxed distance to the goal.
+
+The `--heuristics` option selects how these estimates are combined:
+
+- `and/or` (default) keeps the mixed configuration described below: relaxed
+  AND-OR exploration for `Umin` and `Cmax`, and Hmax for `Umax` and `Cmin`.
+- `hmax` evaluates all four metrics with the relaxed Hmax graph. Internally,
+  this is the depth-zero fallback of the AND-OR estimates.
+- `blind` replaces every heuristic estimate with zero. It does not select BFS
+  automatically; for a blind breadth-first baseline, use
+  `--heuristics blind --search-algorithm bfs`.
 
 ### Why the heuristics differ by metric
 

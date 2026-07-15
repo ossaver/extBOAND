@@ -622,6 +622,51 @@ class CostBoundConsumerTests(unittest.TestCase):
         self.assertEqual(value["h_cmax_unconditional"], 2.0)
         self.assertEqual(value["h_utility_cost"], 4.0)
 
+    def test_depth_zero_uses_hmax_for_every_metric(self):
+        task = SimpleNamespace(
+            max_utility=100.0,
+            utility_of_sas_state=lambda _state: 0.0,
+        )
+        state = ((0,), ())
+
+        with (
+            patch.object(sas_heuristics, "DEFAULT_ANDOR_DEPTH", 0),
+            patch.object(sas_heuristics, "_remaining_budget", return_value=10.0),
+            patch.object(sas_heuristics, "_base_goal_satisfied", return_value=False),
+            patch.object(
+                sas_heuristics,
+                "relaxed_utility_upper_bound",
+                return_value=90.0,
+            ),
+            patch.object(
+                sas_heuristics,
+                "relaxed_goal_distance",
+                return_value=3.0,
+            ),
+            patch.object(
+                sas_heuristics,
+                "relaxed_cost_for_utility",
+                return_value=5.0,
+            ),
+            patch.object(
+                sas_heuristics,
+                "relaxed_utility_loss",
+                return_value=7.0,
+            ),
+            patch.object(
+                sas_heuristics,
+                "_nondeterministic_successor_groups",
+            ) as successor_groups,
+        ):
+            value = sas_heuristics.evaluate_state(task, state)
+
+        self.assertEqual(value["h_loss"], 10.0)
+        self.assertEqual(value["h_loss_min"], 7.0)
+        self.assertEqual(value["h_cmax"], 5.0)
+        self.assertEqual(value["h_cmax_unconditional"], 3.0)
+        self.assertEqual(value["h_cmin"], 3.0)
+        successor_groups.assert_not_called()
+
     def test_policy_bound_keeps_conditional_and_budget_costs_separate(self):
         task = sas.SASTask(max_utility=36.0)
         state = task.state_key((), ())

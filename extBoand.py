@@ -120,9 +120,9 @@ def print_utilities(sas_task):
 
 
 # Prints the final search status and the bi-objective Pareto solutions found.
-def print_search_result(result, use_heuristics):
+def print_search_result(result, heuristic_name):
     print("Policy search:")
-    print(f"  heuristics: {use_heuristics}")
+    print(f"  heuristics: {heuristic_name}")
     print(f"  found:      {result.found}")
     print(f"  reason:     {result.reason}")
     print(f"  expansions: {result.expansions}")
@@ -276,7 +276,7 @@ def result_was_saved_anytime(result):
 
 
 # Defines and parses the command-line interface for the planner.
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
             "Parse, ground, and translate an oversubscription PDDL task "
@@ -353,9 +353,14 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--no-heuristics",
-        action="store_true",
-        help="Disable simple relaxed heuristics for search ordering.",
+        "--heuristics",
+        choices=("and/or", "hmax", "blind"),
+        default="and/or",
+        help=(
+            "Heuristic family to use: relaxed AND/OR for worst-case metrics "
+            "and Hmax for best-case metrics (and/or, default), Hmax for all "
+            "metrics (hmax), or zero estimates (blind)."
+        ),
     )
     parser.add_argument(
         "--andor-depth",
@@ -365,7 +370,7 @@ def parse_args():
             "Depth limit for the relaxed AND-OR guaranteed-utility heuristic. "
             "If omitted, a relaxed-layer estimator selects a value up to 4. "
             "At the limit the heuristic falls back to the admissible relaxed "
-            "utility upper bound."
+            "utility upper bound. Only valid with --heuristics and/or."
         ),
     )
     parser.add_argument(
@@ -379,7 +384,10 @@ def parse_args():
         action="store_true",
         help="Print the full SAS task representation.",
     )
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.heuristics != "and/or" and args.andor_depth is not None:
+        parser.error("--andor-depth can only be used with --heuristics and/or")
+    return args
 
 
 # Runs the full planner pipeline from parsing to optional search and output.
@@ -398,15 +406,24 @@ def main():
     sas_task.cost_bound_criterion = sas_search._cost_bound_criterion(
         args.optimization_order
     )
+    use_heuristics = args.heuristics != "blind"
     depth_estimate = None
-    if args.andor_depth is None:
-        depth_estimate = sas_heuristics.estimate_andor_depth(
-            sas_task,
-            max_depth=4,
-        )
-        sas_heuristics.DEFAULT_ANDOR_DEPTH = depth_estimate["depth"]
-    else:
-        sas_heuristics.DEFAULT_ANDOR_DEPTH = args.andor_depth
+    if args.heuristics == "and/or":
+        if args.andor_depth is None:
+            depth_estimate = sas_heuristics.estimate_andor_depth(
+                sas_task,
+                max_depth=4,
+            )
+            sas_heuristics.DEFAULT_ANDOR_DEPTH = depth_estimate["depth"]
+        else:
+            sas_heuristics.DEFAULT_ANDOR_DEPTH = args.andor_depth
+    elif args.heuristics == "hmax":
+        sas_heuristics.DEFAULT_ANDOR_DEPTH = 0
+    effective_heuristic = (
+        "hmax"
+        if use_heuristics and sas_heuristics.DEFAULT_ANDOR_DEPTH == 0
+        else args.heuristics
+    )
 
     print_summary(
         domain,
@@ -452,7 +469,7 @@ def main():
                 sas_task,
                 max_expansions=args.max_expansions,
                 optimization_order=args.optimization_order,
-                use_heuristics=not args.no_heuristics,
+                use_heuristics=use_heuristics,
                 max_solutions=args.num_solutions,
                 report_every=args.report_every,
                 on_solution=on_solution,
@@ -462,16 +479,16 @@ def main():
                 sas_task,
                 max_expansions=args.max_expansions,
                 optimization_order=args.optimization_order,
-                use_heuristics=not args.no_heuristics,
+                use_heuristics=use_heuristics,
             )
         else:
             result = sas_search.depth_first_and_or_search(
                 sas_task,
                 max_expansions=args.max_expansions,
                 optimization_order=args.optimization_order,
-                use_heuristics=not args.no_heuristics,
+                use_heuristics=use_heuristics,
             )
-        print_search_result(result, use_heuristics=not args.no_heuristics)
+        print_search_result(result, heuristic_name=effective_heuristic)
 
         if result.found and (
             args.search_algorithm != "boand"
