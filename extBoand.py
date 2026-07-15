@@ -21,7 +21,7 @@ def optimization_order(value):
 
     if len(parts) != 4:
         raise argparse.ArgumentTypeError(
-            "Debe indicar cuatro valores separados por comas: Umin,Cmax,Umax,Cmin."
+            "Debe indicar cuatro valores separados por comas: Umin,Umax,Cmax,Cmin."
         )
 
     if any(part != part.strip() or part == "" for part in parts):
@@ -299,8 +299,8 @@ def parse_args():
         "-o",
         "--optimization-order",
         type=optimization_order,
-        default=("Umin", "Cmax", "Umax", "Cmin"),
-        metavar="Umin,Cmax,Umax,Cmin",
+        default=("Umin", "Umax", "Cmax", "Cmin"),
+        metavar="Umin,Umax,Cmax,Cmin",
         help=(
             "BOAND* order. The first two criteria are the objectives and the "
             "last two are only open-list tie-breakers. Provide exactly Umin, "

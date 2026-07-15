@@ -18,13 +18,13 @@ Umin, Cmax, Umax, Cmin
 The default order is:
 
 ```text
-Umin,Cmax,Umax,Cmin
+Umin,Umax,Cmax,Cmin
 ```
 
 The first two positions are the bi-objective optimization criteria. The final two positions are used only as open-list tie-breakers. The order can be changed with:
 
 ```powershell
-python extBoand.py -o Umin,Cmax,Umax,Cmin
+python extBoand.py -o Umin,Umax,Cmax,Cmin
 ```
 
 ## Relevant Parameters
@@ -41,7 +41,7 @@ Available parameters:
 
 - `domain_file`: path to the PDDL domain.
 - `problem_file`: path to the PDDL problem.
-- `-o`, `--optimization-order`: defines the two BOAND* objectives followed by two open-list tie-breakers. It must contain exactly `Umin`, `Cmax`, `Umax`, and `Cmin` once each, separated by commas. Default: `Umin,Cmax,Umax,Cmin`.
+- `-o`, `--optimization-order`: defines the two BOAND* objectives followed by two open-list tie-breakers. It must contain exactly `Umin`, `Cmax`, `Umax`, and `Cmin` once each, separated by commas. Default: `Umin,Umax,Cmax,Cmin`.
 - `--variables`: displays the generated SAS variables and their values.
 - `--actions`: displays the translated SAS actions.
 - `--compile-soft-goals`: forces the compilation of soft goals through dummy actions. When search is executed, this is enabled automatically.

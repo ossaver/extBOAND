@@ -84,7 +84,7 @@ class BasicPolicy:
 def breadth_first_policy_search(
     sas_task,
     max_expansions=10000,
-    optimization_order=("Umin", "Cmax", "Umax", "Cmin"),
+    optimization_order=("Umin", "Umax", "Cmax", "Cmin"),
     use_heuristics=True,
 ):
     _configure_cost_bound_criterion(sas_task, optimization_order)
@@ -169,7 +169,7 @@ def breadth_first_policy_search(
 def depth_first_and_or_search(
     sas_task,
     max_expansions=10000,
-    optimization_order=("Umin", "Cmax", "Umax", "Cmin"),
+    optimization_order=("Umin", "Umax", "Cmax", "Cmin"),
     use_heuristics=True,
 ):
     _configure_cost_bound_criterion(sas_task, optimization_order)
@@ -229,7 +229,7 @@ def depth_first_and_or_search(
 def boand_star_policy_search(
     sas_task,
     max_expansions=None,
-    optimization_order=("Umin", "Cmax", "Umax", "Cmin"),
+    optimization_order=("Umin", "Umax", "Cmax", "Cmin"),
     use_heuristics=True,
     max_solutions=None,
     report_every=1000,
